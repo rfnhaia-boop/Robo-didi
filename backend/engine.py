@@ -258,10 +258,9 @@ def buscar_candles(symbol, interval, outputsize=OUTPUTSIZE):
     if data.get("status") == "error" or "values" not in data:
         raise RuntimeError(f"Twelve Data: {data.get('message', data)}")
 
-    df = pd.DataFrame(data["values"]).copy()
-    for col in ["open", "high", "low", "close"]:
-        df.loc[:, col] = pd.to_numeric(df[col], errors="coerce")
-    df.loc[:, "datetime"] = pd.to_datetime(df["datetime"])
+    df = pd.DataFrame(data["values"])
+    df = df.astype({"open": float, "high": float, "low": float, "close": float})
+    df["datetime"] = pd.to_datetime(df["datetime"])
     df = df.sort_values("datetime").reset_index(drop=True)
     df = df.iloc[:-1].reset_index(drop=True)
     return df[["datetime", "open", "high", "low", "close"]]
