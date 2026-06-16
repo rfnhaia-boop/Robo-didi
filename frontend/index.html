@@ -258,6 +258,13 @@
   .op-cb.ok { background: rgba(46,204,113,0.08); border-color: rgba(46,204,113,0.25); color: #b9f0cf; }
   .op-cb.bloqueado { background: rgba(255,94,94,0.1); border-color: rgba(255,94,94,0.35); color: #ffc4c4; }
   .op-cb b { color: #fff; }
+
+  .inst-selector { display: flex; gap: 6px; }
+  .inst-btn { padding: 6px 12px; font-size: 12px; font-weight: 700; border-radius: 8px;
+    border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.03);
+    color: #8b95a5; cursor: pointer; transition: all .15s; white-space: nowrap; }
+  .inst-btn:hover { color: #e8eef7; border-color: rgba(91,157,255,0.4); }
+  .inst-btn.ativo { background: rgba(91,157,255,0.15); border-color: #5b9dff; color: #fff; }
   
   .home-logo {
     display: flex;
@@ -2283,7 +2290,10 @@
   <div class="main-grafico">
     <div class="area-grafico">
       <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-shrink: 0; margin-bottom: 4px;">
-        <div class="tabs" id="tabs"></div>
+        <div style="display:flex; align-items:center; gap:10px;">
+          <div class="inst-selector" id="inst-selector"></div>
+          <div class="tabs" id="tabs"></div>
+        </div>
         <button class="btn-primary" id="btn-layout" onclick="toggleLayout()" style="padding: 6px 12px; font-size: 11px; height: 32px; border-radius: 8px;">
           <i data-lucide="layout-grid"></i> Layout Grade
         </button>
@@ -3612,8 +3622,35 @@ let tfAtivo = null;
 let monitorando = true;
 let dadosTfs = {};
 let ctxAtual = null;
-let symbolAtual = 'EUR/BRL';
+let symbolAtual = 'EUR/USD';
+let symbolsList = [];
+let precosPorSymbol = {};
 let listaAlertas = [];
+
+function renderInstSelector() {
+  const el = document.getElementById('inst-selector');
+  if (!el || !symbolsList.length) return;
+  el.innerHTML = symbolsList.map(s =>
+    `<button class="inst-btn ${s === symbolAtual ? 'ativo' : ''}" onclick="trocarInstrumento('${s}')">${s}</button>`
+  ).join('');
+}
+
+function trocarInstrumento(sym) {
+  if (sym === symbolAtual) return;
+  symbolAtual = sym;
+  renderInstSelector();
+  fetch(`/api/par/${encodeURIComponent(sym)}`, { method: 'POST' }).catch(() => {});
+  // carrega os candles ja coletados desse instrumento e redesenha
+  const tf = tfAtivo || '30min';
+  fetch(`/api/candles/${tf}?symbol=${encodeURIComponent(sym)}`).then(r => r.json()).then(d => {
+    if (d.candles && d.candles.length) {
+      dadosTfs[tf] = dadosTfs[tf] || {};
+      dadosTfs[tf].candles = d.candles;
+      atualizarGraficos(d.candles);
+    }
+  }).catch(() => {});
+  atualizarHome();
+}
 
 const TF_MIN = {'1min':1,'5min':5,'15min':15,'30min':30,'45min':45,'1h':60};
 
@@ -4858,7 +4895,7 @@ function renderOperacao(e) {
   const ab = document.getElementById('op-abertas');
   if (e.abertas.length) {
     ab.innerHTML = e.abertas.map(p => {
-      const precoVivo = dadosTfs[p.tf]?.aval?.preco;
+      const precoVivo = precosPorSymbol[p.symbol] ?? dadosTfs[p.tf]?.aval?.preco;
       let flut = '';
       if (precoVivo) {
         const risco_preco = Math.abs(p.entrada - p.sl) || 1;
@@ -5139,6 +5176,8 @@ function conectar() {
     if (msg.tipo === 'init') {
       monitorando = msg.monitorando;
       symbolAtual = msg.symbol;
+      if (msg.symbols) { symbolsList = msg.symbols; renderInstSelector(); }
+      if (msg.precos) precosPorSymbol = msg.precos;
       const btn = document.getElementById('btn-pausar');
       btn.innerHTML = monitorando ? '<i data-lucide="pause"></i> Pausar' : '<i data-lucide="play"></i> Retomar';
       btn.className = monitorando ? 'btn-warn' : 'btn-ok';
@@ -5167,7 +5206,14 @@ function conectar() {
       atualizarPaginaSinais();
     }
 
+    if (msg.tipo === 'preco') {
+      precosPorSymbol[msg.symbol] = msg.preco;
+      if (pgAtual === 'operacao') atualizarOperacao();
+      return;
+    }
+
     if (msg.tipo === 'update') {
+      if (msg.symbol) precosPorSymbol[msg.symbol] = msg.aval && msg.aval.preco;
       dadosTfs[msg.tf] = { aval: msg.aval, ts: msg.ts, candles: msg.candles };
       renderEstagios(dadosTfs);
       renderTabs(Object.keys(dadosTfs));
