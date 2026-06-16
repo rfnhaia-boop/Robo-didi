@@ -9,10 +9,23 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 ALERTA_TELEGRAM    = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 ALERTA_PC          = True
 
-SYMBOL                   = "EUR/USD"
-INTERVALOS_OPERACIONAIS  = ["5min", "15min", "30min"]
+# instrumentos monitorados simultaneamente (2 moedas + 2 ativos).
+# Foco no 30min (operado) + 1h (contexto) para caber no limite da API gratis.
+SYMBOLS = ["EUR/USD", "GBP/USD", "XAU/USD", "BTC/USD"]
+SYMBOL                   = SYMBOLS[0]   # primario (compat / grafico principal)
+
+# spread (custo) por instrumento, em preco absoluto
+SPREADS = {
+    "EUR/USD": 0.00012,
+    "GBP/USD": 0.00015,
+    "XAU/USD": 0.30,
+    "BTC/USD": 15.0,
+    "EUR/BRL": 0.0005,
+}
+
+INTERVALOS_OPERACIONAIS  = ["30min"]
 INTERVALO_CONTEXTO       = "1h"
-ESTAGIO_MINIMO_ALERTA    = 1
+ESTAGIO_MINIMO_ALERTA    = 2
 
 DIDI  = dict(curta=3, media=8, longa=20)
 BB    = dict(periodo=20, desvios=2.0)

@@ -13,6 +13,8 @@ import datetime as dt
 
 import pandas as pd
 
+from backend.config import SPREADS
+
 PASTA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dados")
 DB = os.path.join(PASTA, "paper.db")
 
@@ -31,8 +33,9 @@ CONFIG_PADRAO = {
     "breakeven": True,       # move o stop pro zero a zero em +1R
     # circuit breaker — protecao contra dia ruim
     "cb_ativo": True,
-    "max_trades_dia": 3,        # nao abre mais que N trades por dia
+    "max_trades_dia": 3,        # nao abre mais que N trades por dia (por instrumento)
     "perda_max_dia_pct": 3.0,   # para o dia se perder X% da banca
+    "max_posicoes": 3,          # maximo de posicoes abertas ao mesmo tempo (todos os pares)
 }
 
 # avisa o bloqueio do circuit breaker so uma vez por dia
@@ -68,7 +71,7 @@ def _circuit_breaker(c, cfg, symbol=None):
 
 
 def _spread(symbol):
-    return 0.0005 if "BRL" in symbol.upper() else 0.00012
+    return SPREADS.get(symbol, 0.00012)
 
 
 def _conn():
@@ -201,6 +204,12 @@ def processar(symbol, tf, aval, df, hora_brt):
 
     quer_abrir = (tf_certo and direcao and estagio >= cfg["estagio_min"] and dentro_horario
                   and not ja_aberta and not aval.get("contra_tendencia") and len(df) >= 6)
+
+    # limite global: nao passar de N posicoes abertas no total (todos os instrumentos)
+    if quer_abrir:
+        total_abertas = c.execute("SELECT COUNT(*) FROM posicoes WHERE status='aberta'").fetchone()[0]
+        if total_abertas >= cfg.get("max_posicoes", 3):
+            quer_abrir = False
 
     # circuit breaker: tinha sinal valido, mas o limite do dia esta estourado
     if quer_abrir:

@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
 from backend.config import (
-    SYMBOL, INTERVALOS_OPERACIONAIS, INTERVALO_CONTEXTO,
+    SYMBOL, SYMBOLS, INTERVALOS_OPERACIONAIS, INTERVALO_CONTEXTO,
     ESTAGIO_MINIMO_ALERTA, POLL_SEGUNDOS,
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ALERTA_TELEGRAM,
 )
@@ -39,11 +39,15 @@ app.add_middleware(
 # ==========================================================================
 
 estado = {
-    "symbol": SYMBOL,
+    "symbol": SYMBOL,            # primario (compat com o grafico principal)
+    "symbols": list(SYMBOLS),
     "monitorando": True,
     "ultimo_update": None,
-    "timeframes": {},   # tf -> {aval, candles}
-    "contexto": {"direcao": None, "estagio": 0},
+    "timeframes": {},            # tf -> {aval, candles}  (do primario, compat)
+    "contexto": {"direcao": None, "estagio": 0},   # do primario (compat)
+    "dados": {s: {"timeframes": {}, "contexto": {"direcao": None, "estagio": 0}}
+              for s in SYMBOLS},
+    "precos": {},                # symbol -> ultimo preco (P&L flutuante multi-par)
 }
 
 historico_alertas: deque = deque(maxlen=100)
@@ -93,120 +97,132 @@ ultimo_fetch = {}
 ultimo_candle_alertado = {}
 
 
-async def loop_monitoramento():
-    global ultimo_fetch, ultimo_candle_alertado
+async def processar_symbol(symbol, agora):
+    """Busca contexto + timeframes operacionais de UM instrumento e dispara
+    paper/alertas/broadcasts. Tagueado por symbol (multi-instrumento)."""
+    primario = (symbol == estado["symbol"])
+    ddata = estado["dados"][symbol]
 
-    for tf in INTERVALOS_OPERACIONAIS + [INTERVALO_CONTEXTO]:
-        ultimo_fetch[tf] = 0.0
+    # contexto (1h)
+    key_ctx = (symbol, INTERVALO_CONTEXTO)
+    if agora - ultimo_fetch.get(key_ctx, 0) >= SEGUNDOS_POR_INTERVALO[INTERVALO_CONTEXTO]:
+        aval_ctx, _, _, _ = carregar_avaliacao(symbol, INTERVALO_CONTEXTO)
+        ddata["contexto"] = aval_ctx
+        if primario:
+            estado["contexto"] = aval_ctx
+        ultimo_fetch[key_ctx] = agora
+        await asyncio.sleep(1.5)   # respeita rate limit da API
+
+    # timeframes operacionais (30min)
     for tf in INTERVALOS_OPERACIONAIS:
-        ultimo_candle_alertado[tf] = None
+        key = (symbol, tf)
+        if agora - ultimo_fetch.get(key, 0) < SEGUNDOS_POR_INTERVALO[tf]:
+            continue
 
+        aval, ts, df, df_ind = carregar_avaliacao(symbol, tf)
+        aval = filtro_contexto(aval, ddata["contexto"])
+        aval["guarda"] = montar_travas(aval, dt.datetime.now().hour)
+        ultimo_fetch[key] = agora
+
+        candles = df_para_candles(df, df_ind)
+        ddata["timeframes"][tf] = {"aval": aval, "ts": str(ts), "candles": candles}
+        estado["precos"][symbol] = aval.get("preco")
+        estado["ultimo_update"] = dt.datetime.now().isoformat()
+        if primario:
+            estado["timeframes"][tf] = ddata["timeframes"][tf]
+
+        try:
+            forward.verificar(symbol, tf, df)
+        except Exception:
+            pass
+
+        # paper trading: abre/fecha posicoes virtuais ao vivo (todos os instrumentos)
+        try:
+            eventos = paper.processar(symbol, tf, aval, df, dt.datetime.now().hour)
+            for evt in (eventos or []):
+                await broadcast({"tipo": "paper", "operacao": evt, "estado": paper.estado()})
+                if evt["evento"] == "abriu":
+                    emoji = "🟢" if evt["direcao"] == "compra" else "🔴"
+                    enviar_telegram(
+                        f"{emoji} <b>PAPER — ABRIR {evt['direcao'].upper()}</b> | {symbol} {tf}\n"
+                        f"Entrada: {evt['entrada']}\nStop: {evt['sl']}\nAlvo: {evt['tp']}\n"
+                        f"Risco: ${evt['risco']}\n(operacao simulada — copie manualmente)")
+                elif evt["evento"] == "fechou":
+                    ico = "✅" if evt["status"] == "alvo" else ("➖" if evt["status"] == "breakeven" else "❌")
+                    sinal = "+" if evt["resultado"] >= 0 else ""
+                    enviar_telegram(
+                        f"{ico} <b>PAPER — FECHOU ({evt['status'].upper()})</b> | {symbol} {tf}\n"
+                        f"Resultado: {sinal}${evt['resultado']} ({sinal}{evt['resultado_r']}R)\n"
+                        f"Banca: ${evt['banca']}")
+                elif evt["evento"] == "bloqueado":
+                    enviar_telegram(
+                        f"🛑 <b>CIRCUIT BREAKER</b> | {symbol}\n"
+                        f"Parei de operar hoje: {evt['motivo']}.\n"
+                        f"Banca: ${evt['banca']} (protegendo o capital)")
+        except Exception:
+            pass
+
+        # update do grafico: so do instrumento primario (frontend mostra um por vez)
+        if primario:
+            await broadcast({"tipo": "update", "tf": tf, "symbol": symbol, "aval": aval,
+                             "ts": str(ts), "candles": candles,
+                             "contexto": ddata["contexto"]})
+        else:
+            await broadcast({"tipo": "preco", "symbol": symbol, "preco": aval.get("preco")})
+
+        # alerta (todos os instrumentos vao pro historico e Telegram)
+        novo = (ultimo_candle_alertado.get(key) != ts)
+        if aval["estagio"] >= ESTAGIO_MINIMO_ALERTA and novo and aval["direcao"]:
+            alerta = {
+                "hora": dt.datetime.now().strftime("%d/%m %H:%M"),
+                "timestamp": int(ts.timestamp()),
+                "tf": tf, "symbol": symbol,
+                "direcao": aval["direcao"],
+                "estagio": aval["estagio"],
+                "nome": NOMES_ESTAGIO.get(aval["estagio"], ""),
+                "preco": aval["preco"],
+                "componentes": aval["componentes"],
+                "contra_tendencia": aval.get("contra_tendencia", False),
+                "guarda": aval.get("guarda"),
+            }
+            historico_alertas.appendleft(alerta)
+            await broadcast({"tipo": "alerta", "alerta": alerta})
+
+            try:
+                forward.registrar(alerta, df)
+            except Exception:
+                pass
+
+            emoji = "🟢" if aval["direcao"] == "compra" else "🔴"
+            msg_tg = (
+                f"{emoji} <b>{alerta['nome']}</b> | {aval['direcao'].upper()} | {symbol} {tf}\n"
+                f"Preco: {aval['preco']}\n"
+                f"Agulhada: {aval['componentes']['agulhada']}\n"
+                f"Bollinger: {aval['componentes']['bollinger']}\n"
+                f"TRIX: {aval['componentes']['trix']}\n"
+                f"Estocastico: {aval['componentes']['estocastico']}\n"
+                + ("⚠️ contra tendencia\n" if alerta["contra_tendencia"] else "")
+                + "".join(f"⛔ {t}\n" for t in (aval.get("guarda", {}).get("travas") or []))
+                + alerta["hora"]
+            )
+            enviar_telegram(msg_tg)
+            ultimo_candle_alertado[key] = ts
+
+        await asyncio.sleep(1.5)   # respeita rate limit da API entre fetches
+
+
+async def loop_monitoramento():
     while True:
         if not estado["monitorando"]:
             await asyncio.sleep(2)
             continue
 
         agora = time.time()
-        symbol = estado["symbol"]
-
-        try:
-            # contexto
-            if agora - ultimo_fetch.get(INTERVALO_CONTEXTO, 0) >= SEGUNDOS_POR_INTERVALO[INTERVALO_CONTEXTO]:
-                aval_ctx, _, _, _ = carregar_avaliacao(symbol, INTERVALO_CONTEXTO)
-                estado["contexto"] = aval_ctx
-                ultimo_fetch[INTERVALO_CONTEXTO] = agora
-
-            # timeframes operacionais
-            for tf in INTERVALOS_OPERACIONAIS:
-                if agora - ultimo_fetch.get(tf, 0) < SEGUNDOS_POR_INTERVALO[tf]:
-                    continue
-
-                aval, ts, df, df_ind = carregar_avaliacao(symbol, tf)
-                aval = filtro_contexto(aval, estado["contexto"])
-                aval["guarda"] = montar_travas(aval, dt.datetime.now().hour)
-                ultimo_fetch[tf] = agora
-
-                candles = df_para_candles(df, df_ind)
-                estado["timeframes"][tf] = {"aval": aval, "ts": str(ts), "candles": candles}
-                estado["ultimo_update"] = dt.datetime.now().isoformat()
-
-                # forward test: resolve sinais pendentes com os candles novos
-                try:
-                    forward.verificar(symbol, tf, df)
-                except Exception:
-                    pass
-
-                # paper trading: abre/fecha posicoes virtuais ao vivo
-                try:
-                    eventos = paper.processar(symbol, tf, aval, df, dt.datetime.now().hour)
-                    for evt in (eventos or []):
-                        await broadcast({"tipo": "paper", "operacao": evt, "estado": paper.estado()})
-                        if evt["evento"] == "abriu":
-                            emoji = "🟢" if evt["direcao"] == "compra" else "🔴"
-                            enviar_telegram(
-                                f"{emoji} <b>PAPER — ABRIR {evt['direcao'].upper()}</b> | {symbol} {tf}\n"
-                                f"Entrada: {evt['entrada']}\nStop: {evt['sl']}\nAlvo: {evt['tp']}\n"
-                                f"Risco: ${evt['risco']}\n(operacao simulada — copie manualmente)")
-                        elif evt["evento"] == "fechou":
-                            ico = "✅" if evt["status"] == "alvo" else ("➖" if evt["status"] == "breakeven" else "❌")
-                            sinal = "+" if evt["resultado"] >= 0 else ""
-                            enviar_telegram(
-                                f"{ico} <b>PAPER — FECHOU ({evt['status'].upper()})</b> | {symbol} {tf}\n"
-                                f"Resultado: {sinal}${evt['resultado']} ({sinal}{evt['resultado_r']}R)\n"
-                                f"Banca: ${evt['banca']}")
-                        elif evt["evento"] == "bloqueado":
-                            enviar_telegram(
-                                f"🛑 <b>CIRCUIT BREAKER ATIVADO</b> | {symbol}\n"
-                                f"Parei de operar hoje: {evt['motivo']}.\n"
-                                f"Banca: ${evt['banca']} (protegendo o capital)")
-                except Exception:
-                    pass
-
-                await broadcast({"tipo": "update", "tf": tf, "aval": aval,
-                                 "ts": str(ts), "candles": candles,
-                                 "contexto": estado["contexto"]})
-
-                # alerta
-                novo = (ultimo_candle_alertado.get(tf) != ts)
-                if aval["estagio"] >= ESTAGIO_MINIMO_ALERTA and novo and aval["direcao"]:
-                    alerta = {
-                        "hora": dt.datetime.now().strftime("%d/%m %H:%M"),
-                        "timestamp": int(ts.timestamp()),
-                        "tf": tf, "symbol": symbol,
-                        "direcao": aval["direcao"],
-                        "estagio": aval["estagio"],
-                        "nome": NOMES_ESTAGIO.get(aval["estagio"], ""),
-                        "preco": aval["preco"],
-                        "componentes": aval["componentes"],
-                        "contra_tendencia": aval.get("contra_tendencia", False),
-                        "guarda": aval.get("guarda"),
-                    }
-                    historico_alertas.appendleft(alerta)
-                    await broadcast({"tipo": "alerta", "alerta": alerta})
-
-                    # forward test: registra sinais de estagio 2+ para autoavaliacao
-                    try:
-                        forward.registrar(alerta, df)
-                    except Exception:
-                        pass
-
-                    emoji = "🟢" if aval["direcao"] == "compra" else "🔴"
-                    msg_tg = (
-                        f"{emoji} <b>{alerta['nome']}</b> | {aval['direcao'].upper()} | {symbol} {tf}\n"
-                        f"Preco: {aval['preco']}\n"
-                        f"Agulhada: {aval['componentes']['agulhada']}\n"
-                        f"Bollinger: {aval['componentes']['bollinger']}\n"
-                        f"TRIX: {aval['componentes']['trix']}\n"
-                        f"Estocastico: {aval['componentes']['estocastico']}\n"
-                        + ("⚠️ contra tendencia M30\n" if alerta["contra_tendencia"] else "")
-                        + "".join(f"⛔ {t}\n" for t in (aval.get("guarda", {}).get("travas") or []))
-                        + alerta["hora"]
-                    )
-                    enviar_telegram(msg_tg)
-                    ultimo_candle_alertado[tf] = ts
-
-        except Exception as e:
-            await broadcast({"tipo": "erro", "msg": str(e)})
+        for symbol in estado["symbols"]:
+            try:
+                await processar_symbol(symbol, agora)
+            except Exception as e:
+                await broadcast({"tipo": "erro", "symbol": symbol, "msg": str(e)})
 
         await asyncio.sleep(POLL_SEGUNDOS)
 
@@ -221,9 +237,10 @@ ultimo_resumo_enviado = None
 
 
 def montar_resumo_atual():
+    label = f"{len(estado['symbols'])} instrumentos ({', '.join(estado['symbols'])})"
     return resumo_mod.montar_resumo(
         list(historico_alertas), paper.estado(),
-        estado["symbol"], estado.get("contexto"))
+        label, estado.get("contexto"))
 
 
 async def loop_resumo_diario():
@@ -256,25 +273,34 @@ async def startup():
 def status():
     return {
         "symbol": estado["symbol"],
+        "symbols": estado["symbols"],
+        "precos": estado["precos"],
         "monitorando": estado["monitorando"],
         "ultimo_update": estado["ultimo_update"],
         "contexto": estado["contexto"],
         "timeframes": {
-            tf: {
-                "aval": v["aval"],
-                "ts": v["ts"],
-            }
+            tf: {"aval": v["aval"], "ts": v["ts"]}
             for tf, v in estado["timeframes"].items()
+        },
+        "instrumentos": {
+            s: {
+                "contexto": d["contexto"],
+                "timeframes": {tf: {"aval": v["aval"], "ts": v["ts"]}
+                               for tf, v in d["timeframes"].items()},
+            }
+            for s, d in estado["dados"].items()
         },
         "total_alertas": len(historico_alertas),
     }
 
 
 @app.get("/api/candles/{tf}")
-def candles(tf: str):
-    if tf not in estado["timeframes"]:
+def candles(tf: str, symbol: Optional[str] = None):
+    sym = (symbol or estado["symbol"]).upper().replace("-", "/")
+    tfs = estado["dados"].get(sym, {}).get("timeframes", {})
+    if tf not in tfs:
         return {"candles": []}
-    return {"candles": estado["timeframes"][tf]["candles"]}
+    return {"candles": tfs[tf]["candles"]}
 
 
 @app.get("/api/alertas")
@@ -319,6 +345,7 @@ class PaperConfig(BaseModel):
     cb_ativo: Optional[bool] = None
     max_trades_dia: Optional[int] = None
     perda_max_dia_pct: Optional[float] = None
+    max_posicoes: Optional[int] = None
 
 
 @app.post("/api/paper/config")
@@ -353,13 +380,16 @@ def retomar():
 
 @app.post("/api/par/{symbol}")
 def trocar_par(symbol: str):
-    estado["symbol"] = symbol.upper().replace("-", "/")
-    for tf in INTERVALOS_OPERACIONAIS + [INTERVALO_CONTEXTO]:
-        ultimo_fetch[tf] = 0.0
-    for tf in INTERVALOS_OPERACIONAIS:
-        ultimo_candle_alertado[tf] = None
-    estado["timeframes"] = {}
-    return {"ok": True, "symbol": estado["symbol"]}
+    """Troca o instrumento PRIMARIO (o que o grafico principal mostra).
+    So entre os instrumentos ja monitorados — vira o seletor do grafico."""
+    sym = symbol.upper().replace("-", "/")
+    if sym not in estado["dados"]:
+        return {"erro": f"{sym} nao esta na lista monitorada", "symbols": estado["symbols"]}
+    estado["symbol"] = sym
+    # espelha os dados ja coletados desse instrumento nos campos de compat
+    estado["timeframes"] = dict(estado["dados"][sym]["timeframes"])
+    estado["contexto"] = estado["dados"][sym]["contexto"]
+    return {"ok": True, "symbol": sym}
 
 
 # ==========================================================================
@@ -406,6 +436,8 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.send_text(json.dumps({
         "tipo": "init",
         "symbol": estado["symbol"],
+        "symbols": estado["symbols"],
+        "precos": estado["precos"],
         "monitorando": estado["monitorando"],
         "contexto": estado["contexto"],
         "timeframes": {
