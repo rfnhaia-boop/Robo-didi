@@ -9,7 +9,7 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 ALERTA_TELEGRAM    = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 ALERTA_PC          = True
 
-SYMBOL                   = "EUR/BRL"
+SYMBOL                   = "EUR/USD"
 INTERVALOS_OPERACIONAIS  = ["5min", "15min", "30min"]
 INTERVALO_CONTEXTO       = "1h"
 ESTAGIO_MINIMO_ALERTA    = 1
