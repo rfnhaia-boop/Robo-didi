@@ -29,7 +29,42 @@ CONFIG_PADRAO = {
     "hora_fim": 13,
     "respeitar_horario": True,
     "breakeven": True,       # move o stop pro zero a zero em +1R
+    # circuit breaker — protecao contra dia ruim
+    "cb_ativo": True,
+    "max_trades_dia": 3,        # nao abre mais que N trades por dia
+    "perda_max_dia_pct": 3.0,   # para o dia se perder X% da banca
 }
+
+# avisa o bloqueio do circuit breaker so uma vez por dia
+_bloqueio_avisado = None
+
+
+def _stats_dia(c, symbol=None):
+    """Trades abertos hoje e resultado realizado hoje. symbol=None = todos."""
+    hoje = dt.date.today().isoformat()
+    filtro = "AND symbol=?" if symbol else ""
+    args_a = ([symbol, hoje] if symbol else [hoje])
+    trades = c.execute(
+        f"SELECT COUNT(*) FROM posicoes WHERE substr(aberta_em,1,10)=? {filtro}",
+        ([hoje, symbol] if symbol else [hoje])).fetchone()[0]
+    res = c.execute(
+        f"SELECT COALESCE(SUM(resultado),0) FROM posicoes "
+        f"WHERE status!='aberta' AND substr(fechada_em,1,10)=? {filtro}",
+        ([hoje, symbol] if symbol else [hoje])).fetchone()[0]
+    return trades, round(res or 0, 2)
+
+
+def _circuit_breaker(c, cfg, symbol=None):
+    """Devolve (bloqueado, motivo). Avalia limites do dia."""
+    if not cfg.get("cb_ativo"):
+        return False, None
+    trades, res = _stats_dia(c, symbol)
+    banca = _banca(c)
+    if trades >= cfg.get("max_trades_dia", 3):
+        return True, f"limite de {cfg['max_trades_dia']} trades/dia atingido"
+    if res <= -(cfg.get("perda_max_dia_pct", 3.0) / 100.0) * banca:
+        return True, f"perda diaria de {cfg['perda_max_dia_pct']}% atingida"
+    return False, None
 
 
 def _spread(symbol):
@@ -164,8 +199,22 @@ def processar(symbol, tf, aval, df, hora_brt):
         "SELECT 1 FROM posicoes WHERE status='aberta' AND symbol=? AND tf=?",
         (symbol, tf)).fetchone()
 
-    if (tf_certo and direcao and estagio >= cfg["estagio_min"] and dentro_horario and not ja_aberta
-            and not aval.get("contra_tendencia") and len(df) >= 6):
+    quer_abrir = (tf_certo and direcao and estagio >= cfg["estagio_min"] and dentro_horario
+                  and not ja_aberta and not aval.get("contra_tendencia") and len(df) >= 6)
+
+    # circuit breaker: tinha sinal valido, mas o limite do dia esta estourado
+    if quer_abrir:
+        bloqueado, motivo = _circuit_breaker(c, cfg, symbol)
+        if bloqueado:
+            quer_abrir = False
+            global _bloqueio_avisado
+            hoje = dt.date.today().isoformat()
+            if _bloqueio_avisado != hoje:
+                _bloqueio_avisado = hoje
+                eventos.append({"evento": "bloqueado", "symbol": symbol, "tf": tf,
+                                "motivo": motivo, "banca": _banca(c)})
+
+    if quer_abrir:
         entrada = float(df["close"].iloc[-1])
         if direcao == "compra":
             sl = float(df["low"].iloc[-5:].min())
@@ -206,6 +255,8 @@ def estado():
         "SELECT symbol, tf, direcao, entrada, preco_saida, resultado, resultado_r, status, fechada_em "
         "FROM posicoes WHERE status!='aberta' ORDER BY id DESC LIMIT 100").fetchall()
     eq = c.execute("SELECT ts, banca FROM equity ORDER BY id ASC").fetchall()
+    trades_hoje, res_hoje = _stats_dia(c)
+    cb_bloqueado, cb_motivo = _circuit_breaker(c, cfg)
     c.close()
 
     abertas = [dict(zip(["symbol", "tf", "direcao", "entrada", "sl", "tp", "risco", "ts_candle", "breakeven"], a)) for a in abertas]
@@ -228,4 +279,13 @@ def estado():
         "vitorias": len(vit),
         "taxa_acerto": round(len(vit) / total * 100, 1) if total else 0,
         "equity": equity,
+        "circuit_breaker": {
+            "ativo": cfg.get("cb_ativo", False),
+            "trades_hoje": trades_hoje,
+            "max_trades_dia": cfg.get("max_trades_dia"),
+            "resultado_hoje": res_hoje,
+            "perda_max_dia_pct": cfg.get("perda_max_dia_pct"),
+            "bloqueado": cb_bloqueado,
+            "motivo": cb_motivo,
+        },
     }

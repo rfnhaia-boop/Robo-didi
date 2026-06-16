@@ -252,6 +252,12 @@
   .rd-sub { font-size: 11px; color: #8b95a5; margin-top: 4px; }
   .rd-rodape { margin-top: 14px; font-size: 11px; color: #6b7585; text-align: center; }
   @media (max-width: 760px) { .rd-grid { grid-template-columns: repeat(2, 1fr); } }
+
+  .op-cb { margin: 12px 0; border-radius: 12px; padding: 12px 16px; font-size: 12px;
+    display: flex; align-items: center; gap: 10px; border: 1px solid transparent; }
+  .op-cb.ok { background: rgba(46,204,113,0.08); border-color: rgba(46,204,113,0.25); color: #b9f0cf; }
+  .op-cb.bloqueado { background: rgba(255,94,94,0.1); border-color: rgba(255,94,94,0.35); color: #ffc4c4; }
+  .op-cb b { color: #fff; }
   
   .home-logo {
     display: flex;
@@ -2990,6 +2996,8 @@
       </div>
     </div>
 
+    <div id="op-cb" class="op-cb"></div>
+
     <div class="painel" style="padding:22px 24px;">
       <div class="sidebar-title"><i data-lucide="radio"></i> Posições Abertas Agora</div>
       <div id="op-abertas"><div class="op-vazio">Nenhuma posição aberta. Ligue o robô e aguarde um sinal válido (estágio 3, na janela 8h-13h).</div></div>
@@ -4827,6 +4835,24 @@ function renderOperacao(e) {
   const sw = document.getElementById('op-switch');
   sw.className = 'op-switch' + (e.config.ativo ? ' ligado' : '');
   document.getElementById('op-switch-txt').textContent = e.config.ativo ? 'Operando' : 'Desligado';
+
+  // circuit breaker (proteção do dia)
+  const cb = e.circuit_breaker;
+  const cbEl = document.getElementById('op-cb');
+  if (cbEl && cb) {
+    if (!cb.ativo) {
+      cbEl.style.display = 'none';
+    } else if (cb.bloqueado) {
+      cbEl.style.display = 'flex';
+      cbEl.className = 'op-cb bloqueado';
+      cbEl.innerHTML = `🛑 <span><b>Circuit breaker ATIVADO hoje</b> — ${cb.motivo}. O robô parou de abrir trades pra proteger a banca. Reseta amanhã.</span>`;
+    } else {
+      cbEl.style.display = 'flex';
+      cbEl.className = 'op-cb ok';
+      const resSinal = cb.resultado_hoje >= 0 ? '+' : '';
+      cbEl.innerHTML = `🛡 <span><b>Proteção ativa</b> · hoje: ${cb.trades_hoje}/${cb.max_trades_dia} trades · resultado ${resSinal}$${cb.resultado_hoje} (limite −${cb.perda_max_dia_pct}%)</span>`;
+    }
+  }
 
   // posições abertas (com P&L flutuante usando o preço ao vivo)
   const ab = document.getElementById('op-abertas');

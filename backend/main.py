@@ -154,6 +154,11 @@ async def loop_monitoramento():
                                 f"{ico} <b>PAPER — FECHOU ({evt['status'].upper()})</b> | {symbol} {tf}\n"
                                 f"Resultado: {sinal}${evt['resultado']} ({sinal}{evt['resultado_r']}R)\n"
                                 f"Banca: ${evt['banca']}")
+                        elif evt["evento"] == "bloqueado":
+                            enviar_telegram(
+                                f"🛑 <b>CIRCUIT BREAKER ATIVADO</b> | {symbol}\n"
+                                f"Parei de operar hoje: {evt['motivo']}.\n"
+                                f"Banca: ${evt['banca']} (protegendo o capital)")
                 except Exception:
                     pass
 
@@ -311,6 +316,9 @@ class PaperConfig(BaseModel):
     hora_fim: Optional[int] = None
     respeitar_horario: Optional[bool] = None
     breakeven: Optional[bool] = None
+    cb_ativo: Optional[bool] = None
+    max_trades_dia: Optional[int] = None
+    perda_max_dia_pct: Optional[float] = None
 
 
 @app.post("/api/paper/config")
