@@ -265,6 +265,31 @@
     color: #8b95a5; cursor: pointer; transition: all .15s; white-space: nowrap; }
   .inst-btn:hover { color: #e8eef7; border-color: rgba(91,157,255,0.4); }
   .inst-btn.ativo { background: rgba(91,157,255,0.15); border-color: #5b9dff; color: #fff; }
+
+  .panorama-wrap { padding: 16px 20px 0; }
+  .panorama-titulo { display:flex; align-items:center; gap:8px; font-weight:700; font-size:14px; color:#e8eef7; margin-bottom:12px; }
+  .panorama-titulo i { width:16px; height:16px; color:#5b9dff; }
+  .panorama-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; }
+  @media (max-width:900px){ .panorama-grid{ grid-template-columns:repeat(2,1fr); } }
+  .panorama-vazio { grid-column:1/-1; color:#8b95a5; font-size:13px; padding:20px; text-align:center; }
+  .pan-card { background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06);
+    border-radius:14px; padding:14px 16px; cursor:pointer; transition:all .15s; border-left:4px solid #555; }
+  .pan-card:hover { border-color:rgba(91,157,255,0.4); transform:translateY(-2px); }
+  .pan-card.verde { border-left-color:#2ecc71; } .pan-card.amarelo { border-left-color:#f5c451; }
+  .pan-card.vermelho { border-left-color:#ff5e5e; } .pan-card.cinza { border-left-color:#555; }
+  .pan-top { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px; }
+  .pan-sym { font-weight:800; font-size:15px; color:#fff; }
+  .pan-preco { font-size:12px; color:#8b95a5; font-variant-numeric:tabular-nums; }
+  .pan-momento { font-size:13px; font-weight:800; margin-bottom:6px; }
+  .pan-momento.verde{color:#2ecc71;} .pan-momento.amarelo{color:#f5c451;}
+  .pan-momento.vermelho{color:#ff5e5e;} .pan-momento.cinza{color:#9aa4b2;}
+  .pan-tend { display:inline-flex; align-items:center; gap:5px; font-size:12px; font-weight:700; padding:3px 9px; border-radius:20px; margin-bottom:8px; }
+  .pan-tend.alta { color:#2ecc71; background:rgba(46,204,113,0.12); }
+  .pan-tend.baixa { color:#ff5e5e; background:rgba(255,94,94,0.12); }
+  .pan-tend.lateral { color:#9aa4b2; background:rgba(255,255,255,0.05); }
+  .pan-msg { font-size:11.5px; color:#8b95a5; line-height:1.45; }
+  .pan-mini { display:flex; gap:10px; margin-top:8px; font-size:10.5px; color:#6b7585; }
+  .pan-mini b { color:#b6c0cf; font-weight:700; }
   
   .home-logo {
     display: flex;
@@ -2453,6 +2478,13 @@
 
 <!-- ============================ SINAIS ============================ -->
 <div class="pagina" id="pg-sinais">
+  <div class="panorama-wrap">
+    <div class="panorama-titulo"><i data-lucide="layout-dashboard"></i> Panorama dos Instrumentos</div>
+    <div class="panorama-grid" id="panorama-grid">
+      <div class="panorama-vazio">Carregando leitura dos 4 instrumentos...</div>
+    </div>
+  </div>
+
   <div class="sinais-grid">
     <div class="sinais-col">
       <div class="painel card-agora" style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 30px;">
@@ -4043,7 +4075,60 @@ function renderTravas(guarda) {
   cont.innerHTML = html;
 }
 
+const PAN_MOMENTO = {
+  verde:    { txt: '🟢 É O MOMENTO',  cls: 'verde' },
+  amarelo:  { txt: '🟡 CAUTELA',      cls: 'amarelo' },
+  vermelho: { txt: '🔴 ESPERE',       cls: 'vermelho' },
+  cinza:    { txt: '⚪ SEM SETUP',     cls: 'cinza' },
+};
+
+function fmtPreco(p, sym) {
+  if (p == null) return '—';
+  if (sym && (sym.includes('BTC') || sym.includes('XAU'))) return p.toLocaleString('pt-BR', {maximumFractionDigits: 2});
+  return p.toFixed(sym && sym.includes('JPY') ? 3 : 5);
+}
+
+function renderPanorama() {
+  if (pgAtual !== 'sinais') return;
+  const grid = document.getElementById('panorama-grid');
+  if (!grid) return;
+  fetch('/api/status').then(r => r.json()).then(d => {
+    const inst = d.instrumentos || {};
+    const syms = d.symbols || Object.keys(inst);
+    if (!syms.length) return;
+    grid.innerHTML = syms.map(sym => {
+      const node = inst[sym] || {};
+      const aval = (node.timeframes && node.timeframes['30min'] && node.timeframes['30min'].aval) || {};
+      const ctx = node.contexto || {};
+      const guarda = aval.guarda || {};
+      const sem = guarda.semaforo || 'cinza';
+      const m = PAN_MOMENTO[sem] || PAN_MOMENTO.cinza;
+      const preco = (d.precos && d.precos[sym]) ?? aval.preco;
+
+      // tendência geral: contexto (1h) primeiro, senão direção do setup
+      const dir = ctx.direcao || aval.direcao;
+      const tend = dir === 'compra' ? {c:'alta', t:'▲ ALTA'} : (dir === 'venda' ? {c:'baixa', t:'▼ BAIXA'} : {c:'lateral', t:'➖ LATERAL'});
+
+      const msg = guarda.mensagem || 'Aguardando dados...';
+      const adx = aval.adx_valor != null ? aval.adx_valor : '—';
+      const rsi = aval.rsi != null ? aval.rsi : '—';
+      const estagio = aval.estagio || 0;
+
+      return `
+        <div class="pan-card ${m.cls}" onclick="trocarInstrumento('${sym}'); irPara('grafico');">
+          <div class="pan-top"><span class="pan-sym">${sym}</span><span class="pan-preco">${fmtPreco(preco, sym)}</span></div>
+          <div class="pan-momento ${m.cls}">${m.txt}</div>
+          <div class="pan-tend ${tend.c}">${tend.t}</div>
+          <div class="pan-msg">${msg}</div>
+          <div class="pan-mini"><span>Estágio <b>${estagio}/3</b></span><span>ADX <b>${adx}</b></span><span>RSI <b>${rsi}</b></span></div>
+        </div>`;
+    }).join('');
+    lucide.createIcons();
+  }).catch(() => {});
+}
+
 function atualizarPaginaSinais() {
+  renderPanorama();
   atualizarForward();
   const tfs = Object.keys(dadosTfs);
   if (!tfs.length) return;
@@ -5328,6 +5413,7 @@ window.addEventListener('DOMContentLoaded', () => {
   }
   lucide.createIcons();
   if (Notification.permission === 'default') Notification.requestPermission();
+  setInterval(renderPanorama, 15000);   // mantem o panorama fresco
 });
 </script>
 </body>
