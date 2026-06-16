@@ -5019,7 +5019,8 @@ function renderResultadoBacktest(res) {
 let ws;
 
 function conectar() {
-  ws = new WebSocket(`ws://${location.host}/ws`);
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
 
   ws.onopen = () => {
     document.getElementById('dot').classList.remove('pausado');
