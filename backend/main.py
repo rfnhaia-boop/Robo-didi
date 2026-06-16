@@ -23,6 +23,7 @@ from backend.engine import carregar_avaliacao, filtro_contexto, df_para_candles,
 from backend.backtest import rodar_backtest
 from backend import forward
 from backend import paper
+from backend import resumo as resumo_mod
 
 app = FastAPI(title="Robo Didi Forex")
 
@@ -205,9 +206,41 @@ async def loop_monitoramento():
         await asyncio.sleep(POLL_SEGUNDOS)
 
 
+# ==========================================================================
+#  RESUMO DIARIO (18:30 BRT)
+# ==========================================================================
+
+HORA_RESUMO = 18
+MIN_RESUMO = 30
+ultimo_resumo_enviado = None
+
+
+def montar_resumo_atual():
+    return resumo_mod.montar_resumo(
+        list(historico_alertas), paper.estado(),
+        estado["symbol"], estado.get("contexto"))
+
+
+async def loop_resumo_diario():
+    global ultimo_resumo_enviado
+    while True:
+        try:
+            agora = dt.datetime.now()
+            if (agora.hour == HORA_RESUMO and agora.minute >= MIN_RESUMO
+                    and ultimo_resumo_enviado != agora.date()):
+                r = montar_resumo_atual()
+                enviar_telegram(resumo_mod.formatar_telegram(r))
+                await broadcast({"tipo": "resumo", "resumo": r})
+                ultimo_resumo_enviado = agora.date()
+        except Exception:
+            pass
+        await asyncio.sleep(30)
+
+
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(loop_monitoramento())
+    asyncio.create_task(loop_resumo_diario())
 
 
 # ==========================================================================
@@ -248,6 +281,14 @@ def alertas():
 def forward_stats():
     try:
         return forward.estatisticas()
+    except Exception as e:
+        return {"erro": str(e)}
+
+
+@app.get("/api/resumo")
+def resumo_dia():
+    try:
+        return montar_resumo_atual()
     except Exception as e:
         return {"erro": str(e)}
 
