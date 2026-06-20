@@ -141,22 +141,23 @@ async def processar_symbol(symbol, agora):
             eventos = paper.processar(symbol, tf, aval, df, dt.datetime.now().hour)
             for evt in (eventos or []):
                 await broadcast({"tipo": "paper", "operacao": evt, "estado": paper.estado()})
+                est = evt.get("nome", evt.get("estrategia", ""))
                 if evt["evento"] == "abriu":
                     emoji = "🟢" if evt["direcao"] == "compra" else "🔴"
                     enviar_telegram(
-                        f"{emoji} <b>PAPER — ABRIR {evt['direcao'].upper()}</b> | {symbol} {tf}\n"
+                        f"{emoji} <b>[{est}] ABRIR {evt['direcao'].upper()}</b> | {symbol} {tf}\n"
                         f"Entrada: {evt['entrada']}\nStop: {evt['sl']}\nAlvo: {evt['tp']}\n"
                         f"Risco: ${evt['risco']}\n(operacao simulada — copie manualmente)")
                 elif evt["evento"] == "fechou":
                     ico = "✅" if evt["status"] == "alvo" else ("➖" if evt["status"] == "breakeven" else "❌")
                     sinal = "+" if evt["resultado"] >= 0 else ""
                     enviar_telegram(
-                        f"{ico} <b>PAPER — FECHOU ({evt['status'].upper()})</b> | {symbol} {tf}\n"
+                        f"{ico} <b>[{est}] FECHOU ({evt['status'].upper()})</b> | {symbol} {tf}\n"
                         f"Resultado: {sinal}${evt['resultado']} ({sinal}{evt['resultado_r']}R)\n"
                         f"Banca: ${evt['banca']}")
                 elif evt["evento"] == "bloqueado":
                     enviar_telegram(
-                        f"🛑 <b>CIRCUIT BREAKER</b> | {symbol}\n"
+                        f"🛑 <b>[{est}] CIRCUIT BREAKER</b> | {symbol}\n"
                         f"Parei de operar hoje: {evt['motivo']}.\n"
                         f"Banca: ${evt['banca']} (protegendo o capital)")
         except Exception:
@@ -349,18 +350,18 @@ class PaperConfig(BaseModel):
 
 
 @app.post("/api/paper/config")
-def paper_set_config(cfg: PaperConfig):
+def paper_set_config(cfg: PaperConfig, estrategia: str = "A"):
     try:
         novo = {k: v for k, v in cfg.dict().items() if v is not None}
-        return paper.set_config(novo)
+        return paper.set_config(estrategia.upper(), novo)
     except Exception as e:
         return {"erro": str(e)}
 
 
 @app.post("/api/paper/reset")
-def paper_reset():
+def paper_reset(estrategia: Optional[str] = None):
     try:
-        paper.resetar()
+        paper.resetar(estrategia.upper() if estrategia else None)
         return paper.estado()
     except Exception as e:
         return {"erro": str(e)}

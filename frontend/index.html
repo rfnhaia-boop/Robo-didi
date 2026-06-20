@@ -290,6 +290,26 @@
   .pan-msg { font-size:11.5px; color:#8b95a5; line-height:1.45; }
   .pan-mini { display:flex; gap:10px; margin-top:8px; font-size:10.5px; color:#6b7585; }
   .pan-mini b { color:#b6c0cf; font-weight:700; }
+
+  .versus-wrap { margin-bottom:14px; }
+  .versus-titulo { display:flex; align-items:center; gap:8px; font-weight:700; font-size:14px; color:#e8eef7; margin-bottom:12px; }
+  .versus-titulo i { width:16px; height:16px; color:#5b9dff; }
+  .versus-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  @media (max-width:760px){ .versus-grid{ grid-template-columns:1fr; } }
+  .vs-card { background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.07);
+    border-radius:14px; padding:16px 18px; position:relative; transition:all .2s; }
+  .vs-card.lider { border-color:#2ecc71; box-shadow:0 0 0 1px rgba(46,204,113,0.3); }
+  .vs-crown { position:absolute; top:-10px; right:14px; background:#2ecc71; color:#04210f;
+    font-size:10px; font-weight:800; padding:3px 9px; border-radius:20px; }
+  .vs-nome { font-size:11px; color:#8b95a5; text-transform:uppercase; letter-spacing:.4px; }
+  .vs-sub { font-size:12px; color:#b6c0cf; font-weight:700; margin-bottom:10px; }
+  .vs-banca { font-size:26px; font-weight:800; color:#e8eef7; }
+  .vs-banca.pos{color:#2ecc71;} .vs-banca.neg{color:#ff5e5e;}
+  .vs-ret { font-size:13px; font-weight:700; margin-left:6px; }
+  .vs-stats { display:flex; gap:16px; margin-top:10px; font-size:11px; color:#8b95a5; }
+  .vs-stats b { color:#e8eef7; font-weight:700; }
+  .op-sel { display:flex; gap:8px; margin-bottom:12px; align-items:center; }
+  .op-sel-lbl { font-size:12px; color:#8b95a5; }
   
   .home-logo {
     display: flex;
@@ -3008,8 +3028,17 @@
 
     <div class="op-disclaimer">
       <i data-lucide="info"></i>
-      <span><b style="color:var(--texto);">Operação simulada (paper trading).</b> O robô abre e fecha posições virtuais em tempo real seguindo a config campeã — <b>nenhuma ordem real é enviada</b>. Use para acompanhar como seria a operação e copiar manualmente na sua corretora. Quando o placar provar consistência, a gente conecta a corretora para automação real.</span>
+      <span><b style="color:var(--texto);">Operação simulada (paper trading).</b> Duas estratégias rodando em paralelo, cada uma com banca própria — <b>nenhuma ordem real é enviada</b>. Compare ao vivo qual performa melhor antes de arriscar dinheiro.</span>
     </div>
+
+    <div class="versus-wrap" id="versus-wrap">
+      <div class="versus-titulo"><i data-lucide="swords"></i> A vs B — Quem está ganhando?</div>
+      <div class="versus-grid" id="versus-grid">
+        <div class="panorama-vazio">Carregando estratégias...</div>
+      </div>
+    </div>
+
+    <div class="op-sel" id="op-sel"></div>
 
     <div class="painel op-header">
       <div class="op-conta">
@@ -4940,7 +4969,49 @@ async function atualizarOperacao() {
   } catch (_) {}
 }
 
-function renderOperacao(e) {
+let opEstr = 'A';   // estrategia selecionada no detalhe da Operação
+
+function selecionarEstrategiaOp(estr) {
+  opEstr = estr;
+  atualizarOperacao();
+}
+
+function renderVersus(estrategias) {
+  const grid = document.getElementById('versus-grid');
+  if (!grid || !estrategias) return;
+  const arr = Object.values(estrategias);
+  const lider = arr.reduce((a, b) => (b.banca > a.banca ? b : a), arr[0]);
+  grid.innerHTML = arr.map(s => {
+    const ehLider = s.estrategia === lider.estrategia && arr.some(x => x.banca !== lider.banca);
+    const cls = s.retorno_pct > 0 ? 'pos' : (s.retorno_pct < 0 ? 'neg' : '');
+    return `
+      <div class="vs-card ${ehLider ? 'lider' : ''}">
+        ${ehLider ? '<div class="vs-crown">👑 LÍDER</div>' : ''}
+        <div class="vs-nome">Estratégia ${s.estrategia}</div>
+        <div class="vs-sub">${s.nome}</div>
+        <div><span class="vs-banca ${cls}">$${s.banca.toLocaleString('pt-BR')}</span><span class="vs-ret ${cls}">${s.retorno_pct >= 0 ? '+' : ''}${s.retorno_pct}%</span></div>
+        <div class="vs-stats">
+          <span><b>${s.total_operacoes}</b> trades</span>
+          <span><b>${s.total_operacoes ? s.taxa_acerto + '%' : '—'}</b> acerto</span>
+          <span><b>${s.n_abertas}</b> abertas</span>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function renderSelEstrategia(estrategias) {
+  const el = document.getElementById('op-sel');
+  if (!el || !estrategias) return;
+  el.innerHTML = '<span class="op-sel-lbl">Detalhe da estratégia:</span>' +
+    Object.values(estrategias).map(s =>
+      `<button class="inst-btn ${s.estrategia === opEstr ? 'ativo' : ''}" onclick="selecionarEstrategiaOp('${s.estrategia}')">${s.estrategia} · ${s.nome}</button>`
+    ).join('');
+}
+
+function renderOperacao(full) {
+  renderVersus(full.estrategias);
+  renderSelEstrategia(full.estrategias);
+  const e = (full.estrategias && full.estrategias[opEstr]) ? full.estrategias[opEstr] : full;
   paperLigado = e.config.ativo;
   const banca = document.getElementById('op-banca');
   banca.textContent = '$' + e.banca.toLocaleString('pt-BR');
@@ -5054,7 +5125,7 @@ function renderEquityOp(equity) {
 }
 
 async function togglePaper() {
-  await fetch('/api/paper/config', {
+  await fetch(`/api/paper/config?estrategia=${opEstr}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ativo: !paperLigado }),
   });
@@ -5070,15 +5141,15 @@ async function salvarPaperConfig() {
     tf: document.getElementById('op-cfg-tf').value,
     breakeven: document.getElementById('op-cfg-be').value === 'sim',
   };
-  await fetch('/api/paper/config', {
+  await fetch(`/api/paper/config?estrategia=${opEstr}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(cfg),
   });
 }
 
 async function resetPaper() {
-  if (!confirm('Zerar a banca virtual e apagar todo o histórico de operações?')) return;
-  await fetch('/api/paper/reset', { method: 'POST' });
+  if (!confirm(`Zerar a banca virtual da estratégia ${opEstr} e apagar seu histórico?`)) return;
+  await fetch(`/api/paper/reset?estrategia=${opEstr}`, { method: 'POST' });
   atualizarOperacao();
 }
 
@@ -5320,9 +5391,10 @@ function conectar() {
 
     if (msg.tipo === 'paper') {
       const o = msg.operacao;
+      const tag = o.nome ? `[${o.nome}] ` : '';
       if (o.evento === 'abriu') {
         mostrarToast({
-          direcao: o.direcao, nome: '💼 PAPER — ABRIR', tf: o.tf, symbol: o.symbol,
+          direcao: o.direcao, nome: `💼 ${tag}ABRIR`, tf: o.tf, symbol: o.symbol,
           preco: o.entrada, componentes: {}, contra_tendencia: false, estagio: 3,
         });
       } else if (o.evento === 'fechou') {
@@ -5331,7 +5403,7 @@ function conectar() {
         t.className = `toast ${venceu ? 'compra' : 'venda'}`;
         const ico = o.status === 'alvo' ? '✅' : (o.status === 'breakeven' ? '➖' : '❌');
         t.innerHTML = `
-          <div class="toast-titulo">${ico} PAPER — FECHOU (${o.status.toUpperCase()})</div>
+          <div class="toast-titulo">${ico} ${tag}FECHOU (${o.status.toUpperCase()})</div>
           <div class="toast-corpo">${o.symbol} ${o.tf} — ${venceu ? '+' : ''}$${o.resultado} (${o.resultado_r >= 0 ? '+' : ''}${o.resultado_r}R) · banca $${o.banca}</div>`;
         document.body.appendChild(t);
         setTimeout(() => t.remove(), 12000);

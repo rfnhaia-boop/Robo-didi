@@ -228,6 +228,27 @@ def montar_travas(aval, hora_brt):
             "dentro_janela": dentro_janela}
 
 
+def sinal_smc(df, lookback=10):
+    """Smart Money Concept — liquidity sweep + reclaim (como os bancos cacam stops).
+    COMPRA: o candio varre a minima recente (pega liquidez/stops abaixo) mas FECHA
+            de volta acima dela -> reversao institucional. Stop no fundo varrido.
+    VENDA:  varre a maxima recente mas fecha de volta abaixo dela.
+    Devolve {direcao, entrada, sl} ou None."""
+    if df is None or len(df) < lookback + 3:
+        return None
+    c = df.iloc[-1]
+    janela = df.iloc[-(lookback + 1):-1]   # candles anteriores (exclui o atual)
+    min_rec = float(janela["low"].min())
+    max_rec = float(janela["high"].max())
+    low, high, close = float(c["low"]), float(c["high"]), float(c["close"])
+
+    if low < min_rec and close > min_rec:
+        return {"direcao": "compra", "entrada": close, "sl": low}
+    if high > max_rec and close < max_rec:
+        return {"direcao": "venda", "entrada": close, "sl": high}
+    return None
+
+
 def filtro_contexto(aval_op, aval_ctx):
     if aval_op["direcao"] is None or aval_ctx["direcao"] is None:
         aval_op["contra_tendencia"] = False
