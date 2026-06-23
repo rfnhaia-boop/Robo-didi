@@ -146,8 +146,10 @@ def _sinal_entrada(estr, cfg, aval, df):
     tipo = cfg.get("tipo", "didi")
     if tipo == "didi":
         direcao = aval.get("direcao")
+        adx_val = aval.get("adx_valor") or 0
         if (not direcao or aval.get("estagio", 0) < cfg.get("estagio_min", 3)
-                or aval.get("contra_tendencia") or len(df) < 6):
+                or aval.get("contra_tendencia") or len(df) < 6
+                or adx_val < 20):
             return None
         entrada = float(df["close"].iloc[-1])
         if direcao == "compra":
