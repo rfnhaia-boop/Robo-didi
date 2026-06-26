@@ -3443,7 +3443,7 @@ function irPara(pg) {
   const targetPg = document.getElementById('pg-' + pg);
   if (targetPg) targetPg.classList.add('ativa');
   document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('ativo', n.dataset.pg === pg));
-  if (pg === 'grafico') setTimeout(redimensionar, 50);
+  if (pg === 'grafico') { setTimeout(redimensionar, 50); carregarTradesGrafico(); }
   if (pg === 'sinais') atualizarPaginaSinais();
   if (pg === 'mercado') montarMercado();
   if (pg === 'teste') renderTopPadroes();
@@ -3654,24 +3654,63 @@ function atualizarGraficos(candles) {
   }
 }
 
+let marcadoresTrades = [];   // operacoes reais (paper) do instrumento atual
+
+function tsCandleParaUnix(s) {
+  if (!s) return null;
+  // ts_candle e datetime naive em UTC (ex: "2026-06-16 14:30:00")
+  const u = Date.parse(s.replace(' ', 'T') + 'Z');
+  return isNaN(u) ? null : Math.floor(u / 1000);
+}
+
+// Busca as operacoes das 2 estrategias e monta marcadores pro instrumento atual
+function carregarTradesGrafico() {
+  fetch('/api/paper').then(r => r.json()).then(d => {
+    const estr = d.estrategias || {};
+    const out = [];
+    const CORES = { A: '#5b9dff', B: '#f5a742' };   // A=azul, B=laranja
+    Object.values(estr).forEach(s => {
+      const tag = s.estrategia;
+      const cor = CORES[tag] || '#9aa4b2';
+      const lista = [...(s.abertas || []), ...(s.fechadas || [])];
+      lista.filter(p => p.symbol === symbolAtual && p.ts_candle).forEach(p => {
+        const t = tsCandleParaUnix(p.ts_candle);
+        if (!t) return;
+        const compra = p.direcao === 'compra';
+        out.push({
+          time: t,
+          position: compra ? 'belowBar' : 'aboveBar',
+          color: cor,
+          shape: compra ? 'arrowUp' : 'arrowDown',
+          text: `${tag}${compra ? '▲' : '▼'}`,
+          size: 1.4,
+        });
+      });
+    });
+    marcadoresTrades = out;
+    desenharMarcadores();
+  }).catch(() => {});
+}
+
 function desenharMarcadores() {
   if (!series.velas) return;
   const markers = [];
-  
-  const filtrados = listaAlertas.filter(a => a.symbol === symbolAtual && a.tf === tfAtivo);
-  filtrados.forEach(a => {
-    if (a.timestamp) {
-      markers.push({
-        time: a.timestamp,
-        position: a.direcao === 'compra' ? 'belowBar' : 'aboveBar',
-        color: a.direcao === 'compra' ? COR.alta : COR.baixa,
-        shape: a.direcao === 'compra' ? 'arrowUp' : 'arrowDown',
-        text: a.direcao === 'compra' ? 'COMPRA' : 'VENDA',
-        size: 1.8,
-      });
-    }
+
+  // sinais (alertas) do instrumento/tf atual
+  listaAlertas.filter(a => a.symbol === symbolAtual && a.tf === tfAtivo && a.timestamp).forEach(a => {
+    markers.push({
+      time: a.timestamp,
+      position: a.direcao === 'compra' ? 'belowBar' : 'aboveBar',
+      color: a.direcao === 'compra' ? COR.alta : COR.baixa,
+      shape: a.direcao === 'compra' ? 'arrowUp' : 'arrowDown',
+      text: a.direcao === 'compra' ? 'sinal' : 'sinal',
+      size: 1.0,
+    });
   });
-  
+
+  // operacoes reais (paper) — A azul, B laranja
+  marcadoresTrades.forEach(m => markers.push(m));
+
   markers.sort((x, y) => x.time - y.time);
   series.velas.setMarkers(markers);
 }
@@ -3710,6 +3749,7 @@ function trocarInstrumento(sym) {
       atualizarGraficos(d.candles);
     }
   }).catch(() => {});
+  carregarTradesGrafico();
   atualizarHome();
 }
 
@@ -5409,6 +5449,7 @@ function conectar() {
         setTimeout(() => t.remove(), 12000);
       }
       if (pgAtual === 'operacao' && msg.estado) renderOperacao(msg.estado);
+      if (pgAtual === 'grafico') carregarTradesGrafico();
       return;
     }
 
@@ -5486,6 +5527,7 @@ window.addEventListener('DOMContentLoaded', () => {
   lucide.createIcons();
   if (Notification.permission === 'default') Notification.requestPermission();
   setInterval(renderPanorama, 15000);   // mantem o panorama fresco
+  setInterval(() => { if (pgAtual === 'grafico') carregarTradesGrafico(); }, 20000);
 });
 </script>
 </body>

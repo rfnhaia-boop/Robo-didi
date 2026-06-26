@@ -284,14 +284,14 @@ def _estado_estrategia(c, estr):
         "SELECT symbol, tf, direcao, entrada, sl, tp, risco_dinheiro, ts_candle, breakeven "
         "FROM posicoes WHERE status='aberta' AND estrategia=? ORDER BY id DESC", (estr,)).fetchall()
     fechadas = c.execute(
-        "SELECT symbol, tf, direcao, entrada, preco_saida, resultado, resultado_r, status, fechada_em "
+        "SELECT symbol, tf, direcao, entrada, preco_saida, resultado, resultado_r, status, fechada_em, ts_candle "
         "FROM posicoes WHERE status!='aberta' AND estrategia=? ORDER BY id DESC LIMIT 100", (estr,)).fetchall()
     eq = c.execute("SELECT ts, banca FROM equity WHERE estrategia=? ORDER BY id ASC", (estr,)).fetchall()
     trades_hoje, res_hoje = _stats_dia(c, estr)
     cb_bloqueado, cb_motivo = _circuit_breaker(c, estr, cfg)
 
     abertas = [dict(zip(["symbol", "tf", "direcao", "entrada", "sl", "tp", "risco", "ts_candle", "breakeven"], a)) for a in abertas]
-    fechadas = [dict(zip(["symbol", "tf", "direcao", "entrada", "saida", "resultado", "resultado_r", "status", "fechada_em"], f)) for f in fechadas]
+    fechadas = [dict(zip(["symbol", "tf", "direcao", "entrada", "saida", "resultado", "resultado_r", "status", "fechada_em", "ts_candle"], f)) for f in fechadas]
     vit = [f for f in fechadas if f["resultado"] > 0]
     total = len(fechadas)
     equity = [{"time": ts, "value": round(b, 2)} for ts, b in eq]
