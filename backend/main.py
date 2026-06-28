@@ -62,15 +62,49 @@ SEGUNDOS_POR_INTERVALO = {"1min": 60, "5min": 300, "15min": 900,
 #  TELEGRAM
 # ==========================================================================
 
-def enviar_telegram(msg: str):
-    if not ALERTA_TELEGRAM or not TELEGRAM_BOT_TOKEN:
-        return
+import os as _os
+
+# destinatarios extras (alem do dono) ficam num arquivo editavel pelo painel,
+# pra adicionar gente nova SEM precisar mexer na VPS.
+CHATS_FILE = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                           "dados", "telegram_chats.json")
+
+
+def _carregar_chats():
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg,
-                                 "parse_mode": "HTML"}, timeout=10)
+        with open(CHATS_FILE, encoding="utf-8") as f:
+            return json.load(f).get("chats", [])
     except Exception:
-        pass
+        return []
+
+
+def _salvar_chats(chats):
+    _os.makedirs(_os.path.dirname(CHATS_FILE), exist_ok=True)
+    with open(CHATS_FILE, "w", encoding="utf-8") as f:
+        json.dump({"chats": chats}, f, ensure_ascii=False, indent=2)
+
+
+def _destinatarios():
+    ids = []
+    if TELEGRAM_CHAT_ID:
+        ids.append(str(TELEGRAM_CHAT_ID))
+    for c in _carregar_chats():
+        cid = str(c.get("id", "")).strip()
+        if cid and cid not in ids:
+            ids.append(cid)
+    return ids
+
+
+def enviar_telegram(msg: str):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    for cid in _destinatarios():
+        try:
+            requests.post(url, data={"chat_id": cid, "text": msg,
+                                     "parse_mode": "HTML"}, timeout=10)
+        except Exception:
+            pass
 
 
 # ==========================================================================
@@ -365,6 +399,59 @@ def paper_reset(estrategia: Optional[str] = None):
         return paper.estado()
     except Exception as e:
         return {"erro": str(e)}
+
+
+# ==========================================================================
+#  TELEGRAM — gerenciar destinatarios (multi-usuario)
+# ==========================================================================
+
+class ChatTg(BaseModel):
+    id: str
+    nome: Optional[str] = ""
+
+
+@app.get("/api/telegram/chats")
+def telegram_chats():
+    return {"dono": str(TELEGRAM_CHAT_ID), "extras": _carregar_chats(),
+            "total": len(_destinatarios())}
+
+
+@app.get("/api/telegram/pendentes")
+def telegram_pendentes():
+    """Quem mandou mensagem pro bot recentemente — pra pegar o chat_id facil."""
+    if not TELEGRAM_BOT_TOKEN:
+        return {"erro": "bot nao configurado", "pendentes": []}
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates", timeout=10)
+        ups = r.json().get("result", [])
+        vistos, out = set(), []
+        for u in ups:
+            frm = (u.get("message") or {}).get("from") or {}
+            cid = str(frm.get("id", ""))
+            if cid and cid not in vistos:
+                vistos.add(cid)
+                out.append({"id": cid, "username": frm.get("username"),
+                            "nome": frm.get("first_name")})
+        return {"pendentes": out}
+    except Exception as e:
+        return {"erro": str(e), "pendentes": []}
+
+
+@app.post("/api/telegram/add")
+def telegram_add(c: ChatTg):
+    chats = _carregar_chats()
+    if not any(str(x.get("id")) == str(c.id) for x in chats):
+        chats.append({"id": str(c.id), "nome": c.nome or ""})
+        _salvar_chats(chats)
+        enviar_telegram(f"✅ <b>{c.nome or 'Voce'}</b> foi adicionado aos sinais do Robo Didi!")
+    return {"ok": True, "extras": chats}
+
+
+@app.post("/api/telegram/remove")
+def telegram_remove(c: ChatTg):
+    chats = [x for x in _carregar_chats() if str(x.get("id")) != str(c.id)]
+    _salvar_chats(chats)
+    return {"ok": True, "extras": chats}
 
 
 @app.post("/api/pausar")

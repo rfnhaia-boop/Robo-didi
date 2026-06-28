@@ -3171,6 +3171,19 @@
     </div>
     <div class="painel config-item" style="flex-direction: column; align-items: flex-start; gap: 14px;">
       <div>
+        <div class="config-label"><i data-lucide="send" style="width:15px;height:15px;vertical-align:-2px;"></i> Quem recebe os sinais (Telegram)</div>
+        <div class="config-desc">Adicione pessoas pra receberem os alertas no Telegram. <b>A pessoa precisa primeiro mandar uma mensagem pro bot</b> <span style="color:var(--azul)">@RodoDidiOficial_bot</span>, aí ela aparece em "quem falou com o bot".</div>
+      </div>
+      <div id="tg-lista" style="width:100%;"></div>
+      <div style="display:flex; gap:8px; width:100%; flex-wrap:wrap;">
+        <button class="btn-primary" onclick="tgBuscarPendentes()"><i data-lucide="search"></i> Quem falou com o bot</button>
+        <button class="btn-ok" onclick="tgCarregar()"><i data-lucide="refresh-cw"></i> Atualizar lista</button>
+      </div>
+      <div id="tg-pendentes" style="width:100%;"></div>
+    </div>
+
+    <div class="painel config-item" style="flex-direction: column; align-items: flex-start; gap: 14px;">
+      <div>
         <div class="config-label">Simular Sinais (Testes)</div>
         <div class="config-desc">Simule um alerta de Compra ou Venda para verificar o funcionamento visual dos cards, pop-ups e marcações nos gráficos.</div>
       </div>
@@ -3449,6 +3462,7 @@ function irPara(pg) {
   if (pg === 'teste') renderTopPadroes();
   if (pg === 'operacao') atualizarOperacao();
   if (pg === 'home') carregarResumo();
+  if (pg === 'config') tgCarregar();
 }
 
 // ==========================================================================
@@ -5500,6 +5514,54 @@ function trocarPar() {
   document.getElementById('estagios').innerHTML = '';
   document.getElementById('tabs').innerHTML = '';
   atualizarHome();
+}
+
+// ===== Telegram: gerenciar destinatarios =====
+function tgCarregar() {
+  fetch('/api/telegram/chats').then(r => r.json()).then(d => {
+    const el = document.getElementById('tg-lista');
+    if (!el) return;
+    const extras = d.extras || [];
+    let html = `<div style="font-size:12px;color:var(--texto-secondary);margin-bottom:8px;">Recebendo: <b style="color:var(--texto)">${d.total}</b> pessoa(s) · você (dono) + ${extras.length} convidado(s)</div>`;
+    if (extras.length) {
+      html += extras.map(c => `
+        <div style="display:flex;justify-content:space-between;align-items:center;background:rgba(255,255,255,0.03);border:1px solid var(--borda);border-radius:10px;padding:8px 12px;margin-bottom:6px;">
+          <span style="font-size:13px;"><b>${c.nome || 'Sem nome'}</b> <span style="color:var(--texto-secondary);font-size:11px;">id ${c.id}</span></span>
+          <button class="btn-warn" style="padding:4px 10px;font-size:11px;" onclick="tgRemove('${c.id}')">Remover</button>
+        </div>`).join('');
+    } else {
+      html += `<div style="font-size:12px;color:var(--texto-secondary);">Nenhum convidado ainda.</div>`;
+    }
+    el.innerHTML = html;
+  }).catch(() => {});
+}
+
+function tgBuscarPendentes() {
+  const el = document.getElementById('tg-pendentes');
+  el.innerHTML = '<div style="font-size:12px;color:var(--texto-secondary);">Buscando...</div>';
+  fetch('/api/telegram/pendentes').then(r => r.json()).then(d => {
+    const p = d.pendentes || [];
+    if (!p.length) {
+      el.innerHTML = '<div style="font-size:12px;color:var(--vigiar);">Ninguém falou com o bot ainda. Peça pra pessoa abrir @RodoDidiOficial_bot e mandar "oi".</div>';
+      return;
+    }
+    el.innerHTML = '<div style="font-size:12px;color:var(--texto-secondary);margin-bottom:6px;">Clique pra adicionar:</div>' +
+      p.map(x => `
+        <div style="display:flex;justify-content:space-between;align-items:center;background:rgba(91,157,255,0.08);border:1px solid rgba(91,157,255,0.3);border-radius:10px;padding:8px 12px;margin-bottom:6px;">
+          <span style="font-size:13px;"><b>${x.nome || x.username || 'Sem nome'}</b> ${x.username ? '@' + x.username : ''} <span style="color:var(--texto-secondary);font-size:11px;">id ${x.id}</span></span>
+          <button class="btn-ok" style="padding:4px 10px;font-size:11px;" onclick="tgAdd('${x.id}','${(x.nome || x.username || '').replace(/'/g, '')}')"><i data-lucide="plus" style="width:12px;height:12px;"></i> Adicionar</button>
+        </div>`).join('');
+    lucide.createIcons();
+  }).catch(() => {});
+}
+
+function tgAdd(id, nome) {
+  fetch('/api/telegram/add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, nome }) })
+    .then(() => { tgCarregar(); document.getElementById('tg-pendentes').innerHTML = '<div style="font-size:12px;color:var(--compra);">✅ Adicionado! A pessoa já vai receber os próximos sinais.</div>'; });
+}
+
+function tgRemove(id) {
+  fetch('/api/telegram/remove', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) }).then(() => tgCarregar());
 }
 
 function togglePausar() {
