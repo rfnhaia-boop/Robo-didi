@@ -107,6 +107,70 @@ def enviar_telegram(msg: str):
             pass
 
 
+def _enviar_para(cid, msg):
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                      data={"chat_id": cid, "text": msg, "parse_mode": "HTML"}, timeout=10)
+    except Exception:
+        pass
+
+
+# fila de quem falou com o bot mas ainda nao foi adicionado (aparece no painel)
+PEND_FILE = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                          "dados", "telegram_pendentes.json")
+_tg_offset = 0
+
+
+def _carregar_pendentes():
+    try:
+        with open(PEND_FILE, encoding="utf-8") as f:
+            return json.load(f).get("pendentes", [])
+    except Exception:
+        return []
+
+
+def _salvar_pendentes(lst):
+    _os.makedirs(_os.path.dirname(PEND_FILE), exist_ok=True)
+    with open(PEND_FILE, "w", encoding="utf-8") as f:
+        json.dump({"pendentes": lst}, f, ensure_ascii=False, indent=2)
+
+
+async def loop_telegram_rx():
+    """Recebe mensagens do bot: responde confirmando e coloca a pessoa na fila
+    pra ser adicionada pelo painel. Assim o usuario SABE que deu certo."""
+    global _tg_offset
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    ja_registrados = {str(c.get("id")) for c in _carregar_chats()}
+    while True:
+        try:
+            r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                             params={"offset": _tg_offset, "timeout": 0}, timeout=15)
+            for u in r.json().get("result", []):
+                _tg_offset = u["update_id"] + 1
+                frm = (u.get("message") or {}).get("from") or {}
+                cid = str(frm.get("id", ""))
+                if not cid:
+                    continue
+                nome = frm.get("first_name") or frm.get("username") or "amigo"
+                # ja e destinatario? so agradece
+                if cid in _destinatarios():
+                    _enviar_para(cid, f"✅ {nome}, você já está recebendo os sinais do Robo Didi!")
+                    continue
+                # coloca na fila e confirma
+                pend = _carregar_pendentes()
+                if not any(str(p.get("id")) == cid for p in pend):
+                    pend.append({"id": cid, "username": frm.get("username"), "nome": frm.get("first_name")})
+                    _salvar_pendentes(pend)
+                _enviar_para(cid,
+                    f"🤖 <b>Robo Didi Forex</b>\n\nRecebido, {nome}! ✅ Você está na fila.\n"
+                    f"Peça pro admin te <b>liberar no painel</b> que você começa a receber os sinais.\n"
+                    f"(seu ID: <code>{cid}</code>)")
+        except Exception:
+            pass
+        await asyncio.sleep(5)
+
+
 # ==========================================================================
 #  BROADCAST WEBSOCKET
 # ==========================================================================
@@ -298,6 +362,7 @@ async def loop_resumo_diario():
 async def startup():
     asyncio.create_task(loop_monitoramento())
     asyncio.create_task(loop_resumo_diario())
+    asyncio.create_task(loop_telegram_rx())
 
 
 # ==========================================================================
@@ -418,23 +483,10 @@ def telegram_chats():
 
 @app.get("/api/telegram/pendentes")
 def telegram_pendentes():
-    """Quem mandou mensagem pro bot recentemente — pra pegar o chat_id facil."""
-    if not TELEGRAM_BOT_TOKEN:
-        return {"erro": "bot nao configurado", "pendentes": []}
-    try:
-        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates", timeout=10)
-        ups = r.json().get("result", [])
-        vistos, out = set(), []
-        for u in ups:
-            frm = (u.get("message") or {}).get("from") or {}
-            cid = str(frm.get("id", ""))
-            if cid and cid not in vistos:
-                vistos.add(cid)
-                out.append({"id": cid, "username": frm.get("username"),
-                            "nome": frm.get("first_name")})
-        return {"pendentes": out}
-    except Exception as e:
-        return {"erro": str(e), "pendentes": []}
+    """Quem falou com o bot e ainda nao foi adicionado (fila persistida)."""
+    registrados = {str(c.get("id")) for c in _carregar_chats()} | {str(TELEGRAM_CHAT_ID)}
+    fila = [p for p in _carregar_pendentes() if str(p.get("id")) not in registrados]
+    return {"pendentes": fila}
 
 
 @app.post("/api/telegram/add")
@@ -443,7 +495,10 @@ def telegram_add(c: ChatTg):
     if not any(str(x.get("id")) == str(c.id) for x in chats):
         chats.append({"id": str(c.id), "nome": c.nome or ""})
         _salvar_chats(chats)
-        enviar_telegram(f"✅ <b>{c.nome or 'Voce'}</b> foi adicionado aos sinais do Robo Didi!")
+        _enviar_para(str(c.id), f"🎉 <b>{c.nome or 'Você'}</b>, você foi liberado! "
+                     "A partir de agora vai receber todos os sinais do Robo Didi Forex.")
+    # tira da fila de pendentes
+    _salvar_pendentes([p for p in _carregar_pendentes() if str(p.get("id")) != str(c.id)])
     return {"ok": True, "extras": chats}
 
 
