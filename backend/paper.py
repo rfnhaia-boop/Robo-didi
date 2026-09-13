@@ -1,335 +1,318 @@
-"""Paper trading multi-estrategia — duas estrategias rodando em paralelo,
-cada uma com banca propria, posicoes proprias e config propria. Permite
-comparar ao vivo qual performa melhor (A/B). Nenhuma ordem real e enviada.
-
-Estrategia A = Didi (Agulhada) — momentum/tendencia (a campea).
-Estrategia B = Smart Money (Liquidity Sweep) — reversao na liquidez (como bancos).
-"""
-
+"""Versioned paper trading. No broker I/O; disabling only blocks entries."""
 import os
 import json
+import math
+import logging
 import sqlite3
 import datetime as dt
-
 import pandas as pd
-
 from backend.config import SPREADS
 from backend.engine import sinal_smc
+from backend.strategy import entry_signal, market_open
+from backend.execution import VERSION, INTERVAL_SECONDS, validate_candles, size_position, advance, pnl
 
-PASTA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dados")
-DB = os.path.join(PASTA, "paper.db")
-
+log = logging.getLogger(__name__)
+BRT = dt.timezone(dt.timedelta(hours=-3))
+PASTA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'dados')
+DB = os.environ.get('PAPER_DB', os.path.join(PASTA, 'paper.db'))
 BANCA_INICIAL = 10000.0
-
-# base comum de config
-_BASE = {
-    "ativo": True,
-    "tf": "30min",
-    "rr": 3.0,
-    "risco_pct": 1.0,
-    "hora_ini": 8,
-    "hora_fim": 13,
-    "respeitar_horario": True,
-    "breakeven": True,
-    "cb_ativo": True,
-    "max_trades_dia": 3,
-    "perda_max_dia_pct": 3.0,
-    "max_posicoes": 3,
-}
-
-# As duas estrategias (A e B)
+_BASE = dict(ativo=True, tf='30min', rr=3.0, risco_pct=0.25,
+             hora_ini=8, hora_fim=13, respeitar_horario=True, breakeven=True,
+             cb_ativo=True, max_trades_dia=3, perda_max_dia_pct=1.0,
+             max_posicoes=3, exposicao_max_pct=1.0, drawdown_max_pct=10.0,
+             spread_stop_max=0.20, slippage_spreads=0.5)
 ESTRATEGIAS = {
-    "A": {**_BASE, "nome": "Didi (Agulhada)", "tipo": "didi", "estagio_min": 3},
-    "B": {**_BASE, "nome": "Smart Money (Sweep)", "tipo": "smc", "lookback": 10},
+    'A': {**_BASE, 'nome':'Didi (Agulhada)', 'tipo':'didi', 'estagio_min':3},
+    'B': {**_BASE, 'ativo':False, 'nome':'Smart Money (Sweep) — suspensa', 'tipo':'smc', 'lookback':10},
+    'C': {**_BASE, 'nome':'Tendencia (Rompimento)', 'tipo':'trend', 'rr':2.0,
+          'breakeven':False, 'symbols':['XAU/USD','BTC/USD']},
 }
+CHAVES_VALIDAS = set(_BASE) | {'nome','tipo','estagio_min','lookback','symbols'}
 
-CHAVES_VALIDAS = set(_BASE) | {"nome", "tipo", "estagio_min", "lookback"}
 
-_bloqueio_avisado = {}   # estrategia -> data
+def agora():
+    return dt.datetime.now(BRT)
 
 
 def _spread(symbol):
-    return SPREADS.get(symbol, 0.00012)
+    if symbol not in SPREADS:
+        raise ValueError('Spread nao configurado: '+symbol)
+    return SPREADS[symbol]
 
 
 def _conn():
-    os.makedirs(PASTA, exist_ok=True)
-    c = sqlite3.connect(DB)
-    c.execute("""CREATE TABLE IF NOT EXISTS contas (
-        estrategia TEXT PRIMARY KEY, banca REAL, config TEXT, criado_em TEXT)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS posicoes (
+    os.makedirs(os.path.dirname(os.path.abspath(DB)), exist_ok=True)
+    c = sqlite3.connect(DB, timeout=30)
+    c.row_factory = sqlite3.Row
+    # Preserve the pre A/B schema under explicit archive table names. It cannot
+    # be mixed safely with versioned campaigns, but no historical row is lost.
+    tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if 'posicoes' in tables:
+        old={r[1] for r in c.execute('PRAGMA table_info(posicoes)')}
+        if 'estrategia' not in old:
+            if 'posicoes_legacy_v1' in tables:
+                raise RuntimeError('Migracao antiga ambigua: posicoes_legacy_v1 ja existe')
+            c.execute('ALTER TABLE posicoes RENAME TO posicoes_legacy_v1')
+    if 'equity' in tables:
+        old={r[1] for r in c.execute('PRAGMA table_info(equity)')}
+        if 'estrategia' not in old:
+            if 'equity_legacy_v1' in tables:
+                raise RuntimeError('Migracao antiga ambigua: equity_legacy_v1 ja existe')
+            c.execute('ALTER TABLE equity RENAME TO equity_legacy_v1')
+    c.execute('''CREATE TABLE IF NOT EXISTS contas (
+        estrategia TEXT PRIMARY KEY, banca REAL, config TEXT, criado_em TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS posicoes (
         id INTEGER PRIMARY KEY AUTOINCREMENT, estrategia TEXT,
         aberta_em TEXT, ts_candle TEXT, symbol TEXT, tf TEXT,
         direcao TEXT, entrada REAL, sl REAL, sl_original REAL, tp REAL,
         risco_dinheiro REAL, tamanho REAL, breakeven INTEGER DEFAULT 0,
-        status TEXT DEFAULT 'aberta',
-        fechada_em TEXT, preco_saida REAL, resultado REAL, resultado_r REAL)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS equity (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, estrategia TEXT, ts INTEGER, banca REAL)""")
-    # garante uma conta por estrategia
-    for estr, cfg in ESTRATEGIAS.items():
-        row = c.execute("SELECT 1 FROM contas WHERE estrategia=?", (estr,)).fetchone()
-        if not row:
-            c.execute("INSERT INTO contas (estrategia, banca, config, criado_em) VALUES (?,?,?,?)",
-                      (estr, BANCA_INICIAL, json.dumps(cfg), dt.datetime.now().isoformat()))
+        status TEXT DEFAULT 'aberta', fechada_em TEXT, preco_saida REAL,
+        resultado REAL, resultado_r REAL)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS equity (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, estrategia TEXT, ts INTEGER, banca REAL)''')
+    columns = {r[1] for r in c.execute('PRAGMA table_info(posicoes)')}
+    for name, kind in [('ultimo_candle','TEXT'),('custo','REAL'),('config_entrada','TEXT'),
+                       ('versao','TEXT'),('erro_dados','TEXT'),('candle_saida','TEXT')]:
+        if name not in columns:
+            c.execute(f'ALTER TABLE posicoes ADD COLUMN {name} {kind}')
+    c.execute('''CREATE TABLE IF NOT EXISTS ciclos (
+        estrategia TEXT, symbol TEXT, tf TEXT, ts TEXT,
+        PRIMARY KEY (estrategia,symbol,tf))''')
+    for e, cfg in ESTRATEGIAS.items():
+        c.execute('INSERT OR IGNORE INTO contas VALUES (?,?,?,?)',
+                  (e, BANCA_INICIAL, json.dumps(cfg), agora().isoformat()))
     c.commit()
     return c
 
 
-def get_config(estr):
-    c = _conn()
-    row = c.execute("SELECT config FROM contas WHERE estrategia=?", (estr,)).fetchone()
-    c.close()
-    base = dict(ESTRATEGIAS[estr])
-    if row:
-        base.update(json.loads(row[0]))
-    return base
+def get_config(estr, c=None):
+    own = c is None
+    c = c or _conn()
+    try:
+        row = c.execute('SELECT config FROM contas WHERE estrategia=?',(estr,)).fetchone()
+        return {**ESTRATEGIAS[estr], **(json.loads(row[0]) if row else {})}
+    finally:
+        if own:
+            c.close()
+
+
+def validate_config(cfg):
+    for k in ['ativo','respeitar_horario','breakeven','cb_ativo']:
+        if type(cfg[k]) is not bool:
+            raise ValueError(k+': esperado booleano')
+    bounds = {'risco_pct':(0.01,2), 'rr':(0.5,10), 'perda_max_dia_pct':(0.1,5),
+              'exposicao_max_pct':(0.1,5), 'drawdown_max_pct':(1,20),
+              'spread_stop_max':(0.01,0.5), 'slippage_spreads':(0,5),
+              'max_trades_dia':(1,20), 'max_posicoes':(1,10),
+              'hora_ini':(0,23), 'hora_fim':(1,24)}
+    for k, (lo,hi) in bounds.items():
+        v=cfg[k]
+        if isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(v) or not lo<=v<=hi:
+            raise ValueError(k+': fora dos limites')
+    for k in ['max_trades_dia','max_posicoes','hora_ini','hora_fim']:
+        if int(cfg[k])!=cfg[k]:
+            raise ValueError(k+': esperado inteiro')
+    if cfg['hora_ini']>=cfg['hora_fim'] or cfg['tf'] not in INTERVAL_SECONDS:
+        raise ValueError('Horario ou timeframe invalido')
+    if cfg['tipo'] not in ('didi','smc','trend') or cfg.get('estagio_min',3) not in (2,3):
+        raise ValueError('Estrategia invalida')
+    lookback=cfg.get('lookback',10)
+    if type(lookback) is not int or not 3<=lookback<=100:
+        raise ValueError('Lookback invalido')
 
 
 def set_config(estr, novo):
     if estr not in ESTRATEGIAS:
-        return {"erro": "estrategia invalida"}
-    c = _conn()
-    cfg = get_config(estr)
-    cfg.update({k: v for k, v in novo.items() if k in CHAVES_VALIDAS})
-    c.execute("UPDATE contas SET config=? WHERE estrategia=?", (json.dumps(cfg), estr))
-    c.commit()
-    c.close()
-    return cfg
+        raise ValueError('Estrategia invalida')
+    c=_conn()
+    try:
+        cfg={**get_config(estr,c), **{k:v for k,v in novo.items() if k in CHAVES_VALIDAS}}
+        validate_config(cfg)
+        c.execute('UPDATE contas SET config=? WHERE estrategia=?',(json.dumps(cfg),estr))
+        c.commit()
+        return cfg
+    finally:
+        c.close()
 
 
 def resetar(estr=None):
-    c = _conn()
-    alvos = [estr] if estr else list(ESTRATEGIAS)
-    for e in alvos:
-        c.execute("DELETE FROM posicoes WHERE estrategia=?", (e,))
-        c.execute("DELETE FROM equity WHERE estrategia=?", (e,))
-        c.execute("UPDATE contas SET banca=? WHERE estrategia=?", (BANCA_INICIAL, e))
-    c.commit()
-    c.close()
+    raise ValueError('Reset desativado: preserve o historico e inicie campanha em PAPER_DB separado')
 
 
 def _banca(c, estr):
-    r = c.execute("SELECT banca FROM contas WHERE estrategia=?", (estr,)).fetchone()
-    return r[0] if r else BANCA_INICIAL
+    return c.execute('SELECT banca FROM contas WHERE estrategia=?',(estr,)).fetchone()[0]
 
 
 def _stats_dia(c, estr, symbol=None):
-    hoje = dt.date.today().isoformat()
-    if symbol:
-        trades = c.execute("SELECT COUNT(*) FROM posicoes WHERE estrategia=? AND symbol=? AND substr(aberta_em,1,10)=?",
-                           (estr, symbol, hoje)).fetchone()[0]
-        res = c.execute("SELECT COALESCE(SUM(resultado),0) FROM posicoes WHERE estrategia=? AND status!='aberta' AND symbol=? AND substr(fechada_em,1,10)=?",
-                        (estr, symbol, hoje)).fetchone()[0]
-    else:
-        trades = c.execute("SELECT COUNT(*) FROM posicoes WHERE estrategia=? AND substr(aberta_em,1,10)=?",
-                           (estr, hoje)).fetchone()[0]
-        res = c.execute("SELECT COALESCE(SUM(resultado),0) FROM posicoes WHERE estrategia=? AND status!='aberta' AND substr(fechada_em,1,10)=?",
-                        (estr, hoje)).fetchone()[0]
-    return trades, round(res or 0, 2)
+    day=agora().date().isoformat()
+    extra=' AND symbol=?' if symbol else ''
+    args=(estr,day,symbol) if symbol else (estr,day)
+    n=c.execute("SELECT COUNT(*) FROM posicoes WHERE estrategia=? AND substr(aberta_em,1,10)=?"+extra,args).fetchone()[0]
+    r=c.execute("SELECT COALESCE(SUM(resultado),0) FROM posicoes WHERE estrategia=? AND substr(fechada_em,1,10)=? AND status!='aberta'"+extra,args).fetchone()[0]
+    return n,float(r)
 
 
-def _circuit_breaker(c, estr, cfg, symbol=None):
-    if not cfg.get("cb_ativo"):
-        return False, None
-    trades, res = _stats_dia(c, estr, symbol)
-    banca = _banca(c, estr)
-    if trades >= cfg.get("max_trades_dia", 3):
-        return True, f"limite de {cfg['max_trades_dia']} trades/dia atingido"
-    if res <= -(cfg.get("perda_max_dia_pct", 3.0) / 100.0) * banca:
-        return True, f"perda diaria de {cfg['perda_max_dia_pct']}% atingida"
-    return False, None
+def _risk_state(c, estr):
+    bank=_banca(c,estr)
+    _,realised=_stats_dia(c,estr)
+    start=bank-realised
+    exposure=0.0
+    for row in c.execute("SELECT * FROM posicoes WHERE estrategia=? AND status='aberta'",(estr,)):
+        p=dict(row)
+        cost=p['custo'] if p['custo'] is not None else _spread(p['symbol'])
+        loss,_=pnl(p,p['sl'],cost)
+        exposure+=max(0,-loss)
+    peak=max(BANCA_INICIAL,c.execute('SELECT COALESCE(MAX(banca),0) FROM equity WHERE estrategia=?',(estr,)).fetchone()[0])
+    return bank,start,realised,exposure,(peak-bank)/peak*100
 
 
-def _sinal_entrada(estr, cfg, aval, df):
-    """Devolve {direcao, entrada, sl} conforme o tipo da estrategia, ou None."""
-    tipo = cfg.get("tipo", "didi")
-    if tipo == "didi":
-        direcao = aval.get("direcao")
-        adx_val = aval.get("adx_valor") or 0
-        if (not direcao or aval.get("estagio", 0) < cfg.get("estagio_min", 3)
-                or aval.get("contra_tendencia") or len(df) < 6
-                or adx_val < 20):
-            return None
-        entrada = float(df["close"].iloc[-1])
-        if direcao == "compra":
-            sl = float(df["low"].iloc[-5:].min())
-        else:
-            sl = float(df["high"].iloc[-5:].max())
-        return {"direcao": direcao, "entrada": entrada, "sl": sl}
-    elif tipo == "smc":
-        return sinal_smc(df, cfg.get("lookback", 10))
-    return None
+def _circuit_breaker(c, estr, cfg, symbol=None, novo_risco=0):
+    # One global scope for both the panel and entry execution.
+    n,_=_stats_dia(c,estr)
+    bank,start,realised,exposure,dd=_risk_state(c,estr)
+    if bank<=0:
+        return True,'Banca esgotada'
+    if dd>=cfg['drawdown_max_pct']:
+        return True,'Drawdown maximo: campanha exige revisao'
+    if exposure+novo_risco>bank*cfg['exposicao_max_pct']/100+1e-8:
+        return True,'Limite de risco agregado das posicoes'
+    if cfg['cb_ativo']:
+        if n>=cfg['max_trades_dia']:
+            return True,f"Limite global de {cfg['max_trades_dia']} trades/dia"
+        if -realised+exposure+novo_risco>=start*cfg['perda_max_dia_pct']/100-1e-8:
+            return True,'Orcamento diario de perda comprometido (inclui posicoes abertas)'
+    return False,None
 
 
-def _processar_estrategia(c, estr, symbol, tf, aval, df, hora_brt):
-    cfg = get_config(estr)
-    eventos = []
-    if not cfg.get("ativo"):
-        return eventos
-    spread = _spread(symbol)
+def _sinal_entrada(estr,cfg,aval,df):
+    return entry_signal(cfg,aval,df)
 
-    # 1) resolve posicoes abertas desta estrategia/symbol/tf
-    abertas = c.execute(
-        "SELECT id, ts_candle, direcao, entrada, sl, sl_original, tp, risco_dinheiro, breakeven "
-        "FROM posicoes WHERE status='aberta' AND estrategia=? AND symbol=? AND tf=?",
-        (estr, symbol, tf)).fetchall()
 
-    for pid, ts_candle, direcao, entrada, sl, sl_orig, tp, risco_din, be in abertas:
-        sl_orig = sl_orig if sl_orig is not None else sl
-        depois = df[df["datetime"] > pd.Timestamp(ts_candle)]
-        if not len(depois):
+def _processar_estrategia(c,estr,symbol,tf,aval,df,hora_brt,permitir_entradas=True):
+    cfg=get_config(estr,c)
+    events=[]
+    for row in c.execute("SELECT * FROM posicoes WHERE status='aberta' AND estrategia=? AND symbol=? AND tf=?",(estr,symbol,tf)).fetchall():
+        p=dict(row)
+        cursor=p['ultimo_candle'] or p['ts_candle']
+        legacy=p['versao'] is None
+        if legacy:
+            p['sl']=p['sl_original'] if p['sl_original'] is not None else p['sl']
+            p['sl_original']=p['sl']
+            p['breakeven']=0
+            cursor=p['ts_candle']
+        new=df[df.datetime>pd.Timestamp(cursor)]
+        if new.empty:
             continue
-        risco_preco = abs(entrada - sl_orig)
-        status, saida = None, None
-        for _, row in depois.iterrows():
-            if direcao == "compra":
-                if row["low"] <= sl:   status, saida = ("breakeven" if be else "stop"), sl; break
-                if row["high"] >= tp:  status, saida = "alvo", tp; break
-                if cfg["breakeven"] and not be and risco_preco > 0 and row["high"] >= entrada + risco_preco:
-                    sl, be = entrada, 1
-                    c.execute("UPDATE posicoes SET sl=?, breakeven=1 WHERE id=?", (round(sl, 5), pid))
-            else:
-                if row["high"] >= sl:  status, saida = ("breakeven" if be else "stop"), sl; break
-                if row["low"] <= tp:   status, saida = "alvo", tp; break
-                if cfg["breakeven"] and not be and risco_preco > 0 and row["low"] <= entrada - risco_preco:
-                    sl, be = entrada, 1
-                    c.execute("UPDATE posicoes SET sl=?, breakeven=1 WHERE id=?", (round(sl, 5), pid))
-        if status:
-            ganho = (saida - entrada) if direcao == "compra" else (entrada - saida)
-            ganho -= spread
-            resultado_r = round(ganho / risco_preco, 2) if risco_preco else 0
-            resultado = round(risco_din * resultado_r, 2)
-            nova_banca = round(_banca(c, estr) + resultado, 2)
-            c.execute("""UPDATE posicoes SET status=?, fechada_em=?, preco_saida=?,
-                         resultado=?, resultado_r=? WHERE id=?""",
-                      (status, dt.datetime.now().isoformat(), round(saida, 5),
-                       resultado, resultado_r, pid))
-            c.execute("UPDATE contas SET banca=? WHERE estrategia=?", (nova_banca, estr))
-            c.execute("INSERT INTO equity (estrategia, ts, banca) VALUES (?,?,?)",
-                      (estr, int(dt.datetime.now().timestamp()), nova_banca))
-            eventos.append({"evento": "fechou", "estrategia": estr, "nome": cfg["nome"],
-                            "symbol": symbol, "tf": tf, "direcao": direcao,
-                            "status": status, "resultado": resultado, "resultado_r": resultado_r,
-                            "saida": round(saida, 5), "banca": nova_banca})
-    c.commit()
-
-    # 2) abre nova posicao
-    dentro_horario = (not cfg["respeitar_horario"]) or (cfg["hora_ini"] <= hora_brt < cfg["hora_fim"])
-    tf_certo = (tf == cfg["tf"])
-    ja_aberta = c.execute("SELECT 1 FROM posicoes WHERE status='aberta' AND estrategia=? AND symbol=? AND tf=?",
-                          (estr, symbol, tf)).fetchone()
-
-    sinal = _sinal_entrada(estr, cfg, aval, df) if (tf_certo and dentro_horario and not ja_aberta) else None
-    quer_abrir = sinal is not None
-
-    if quer_abrir:
-        total_abertas = c.execute("SELECT COUNT(*) FROM posicoes WHERE status='aberta' AND estrategia=?", (estr,)).fetchone()[0]
-        if total_abertas >= cfg.get("max_posicoes", 3):
-            quer_abrir = False
-
-    if quer_abrir:
-        bloqueado, motivo = _circuit_breaker(c, estr, cfg, symbol)
-        if bloqueado:
-            quer_abrir = False
-            hoje = dt.date.today().isoformat()
-            if _bloqueio_avisado.get(estr) != hoje:
-                _bloqueio_avisado[estr] = hoje
-                eventos.append({"evento": "bloqueado", "estrategia": estr, "nome": cfg["nome"],
-                                "symbol": symbol, "tf": tf, "motivo": motivo, "banca": _banca(c, estr)})
-
-    if quer_abrir:
-        direcao = sinal["direcao"]
-        entrada = sinal["entrada"]
-        sl = sinal["sl"]
-        risco_preco = (entrada - sl) if direcao == "compra" else (sl - entrada)
-        tp = entrada + cfg["rr"] * risco_preco if direcao == "compra" else entrada - cfg["rr"] * risco_preco
-        if risco_preco > 0:
-            banca = _banca(c, estr)
-            risco_din = round(banca * cfg["risco_pct"] / 100.0, 2)
-            tamanho = round(risco_din / risco_preco, 2)
-            c.execute("""INSERT INTO posicoes
-                (estrategia, aberta_em, ts_candle, symbol, tf, direcao, entrada, sl, sl_original, tp,
-                 risco_dinheiro, tamanho) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (estr, dt.datetime.now().isoformat(), str(df["datetime"].iloc[-1]),
-                 symbol, tf, direcao, round(entrada, 5), round(sl, 5), round(sl, 5), round(tp, 5),
-                 risco_din, tamanho))
-            c.commit()
-            eventos.append({"evento": "abriu", "estrategia": estr, "nome": cfg["nome"],
-                            "symbol": symbol, "tf": tf, "direcao": direcao,
-                            "entrada": round(entrada, 5), "sl": round(sl, 5), "tp": round(tp, 5),
-                            "risco": risco_din})
-    return eventos
+        if pd.Timestamp(cursor)<df.datetime.iloc[0]-pd.Timedelta(seconds=INTERVAL_SECONDS[tf]):
+            c.execute('UPDATE posicoes SET erro_dados=? WHERE id=?',('Historico insuficiente; recuperar candles antes de resolver',p['id']))
+            events.append(dict(evento='erro_dados',estrategia=estr,symbol=symbol,tf=tf))
+            continue
+        stored=json.loads(p['config_entrada']) if p['config_entrada'] else cfg
+        cost=p['custo'] if p['custo'] is not None else _spread(symbol)
+        exit_event=None
+        for _,bar in new.iterrows():
+            p,exit_event=advance(p,bar,stored['breakeven'])
+            cursor=str(bar.datetime)
+            if exit_event:
+                break
+        c.execute('UPDATE posicoes SET sl=?,breakeven=?,ultimo_candle=?,versao=?,erro_dados=NULL WHERE id=?',
+                  (p['sl'],p['breakeven'],cursor,'legacy-replayed-v2' if legacy else p['versao'],p['id']))
+        if exit_event:
+            status,price=exit_event
+            value,rr=pnl(p,price,cost)
+            value=round(value,2)
+            bank=round(_banca(c,estr)+value,2)
+            c.execute('''UPDATE posicoes SET status=?,fechada_em=?,preco_saida=?,resultado=?,resultado_r=?,candle_saida=? WHERE id=?''',
+                      (status,agora().isoformat(),price,value,round(rr,4),cursor,p['id']))
+            c.execute('UPDATE contas SET banca=? WHERE estrategia=?',(bank,estr))
+            c.execute('INSERT INTO equity (estrategia,ts,banca) VALUES (?,?,?)',(estr,int(agora().timestamp()),bank))
+            events.append(dict(evento='fechou',estrategia=estr,nome=cfg['nome'],symbol=symbol,tf=tf,
+                               direcao=p['direcao'],status=status,resultado=value,resultado_r=round(rr,4),saida=price,banca=bank))
+    ts=str(df.datetime.iloc[-1])
+    previous=c.execute('SELECT ts FROM ciclos WHERE estrategia=? AND symbol=? AND tf=?',(estr,symbol,tf)).fetchone()
+    fresh=not previous or pd.Timestamp(previous[0])<pd.Timestamp(ts)
+    if fresh:
+        c.execute('INSERT OR REPLACE INTO ciclos VALUES (?,?,?,?)',(estr,symbol,tf,ts))
+    if not (fresh and permitir_entradas and cfg['ativo'] and tf==cfg['tf']):
+        return events
+    if cfg['respeitar_horario'] and not cfg['hora_ini']<=hora_brt<cfg['hora_fim']:
+        return events
+    if cfg.get('symbols') and symbol not in cfg['symbols']:
+        return events
+    if not market_open(symbol,pd.Timestamp(ts)+pd.Timedelta(seconds=INTERVAL_SECONDS[tf])):
+        return events
+    if c.execute("SELECT 1 FROM posicoes WHERE estrategia=? AND status='aberta' AND (symbol=? OR erro_dados IS NOT NULL)",(estr,symbol)).fetchone():
+        return events
+    count=c.execute("SELECT COUNT(*) FROM posicoes WHERE estrategia=? AND status='aberta'",(estr,)).fetchone()[0]
+    if count>=cfg['max_posicoes']:
+        return events
+    signal=_sinal_entrada(estr,cfg,aval,df)
+    if not signal:
+        return events
+    entry,stop=signal['entrada'],signal['sl']
+    distance=entry-stop if signal['direcao']=='compra' else stop-entry
+    spread=_spread(symbol)
+    if distance<=0 or spread/distance>cfg['spread_stop_max']:
+        return events
+    budget=round(_banca(c,estr)*cfg['risco_pct']/100,2)
+    blocked,reason=_circuit_breaker(c,estr,cfg,novo_risco=budget)
+    if blocked:
+        events.append(dict(evento='bloqueado',estrategia=estr,nome=cfg['nome'],symbol=symbol,tf=tf,motivo=reason,banca=_banca(c,estr)))
+        return events
+    cost=spread*(1+cfg['slippage_spreads'])
+    size=size_position(entry,stop,budget,cost)
+    target=entry+cfg['rr']*distance if signal['direcao']=='compra' else entry-cfg['rr']*distance
+    c.execute('''INSERT INTO posicoes
+      (estrategia,aberta_em,ts_candle,symbol,tf,direcao,entrada,sl,sl_original,tp,risco_dinheiro,tamanho,
+       ultimo_candle,custo,config_entrada,versao) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+      (estr,agora().isoformat(),ts,symbol,tf,signal['direcao'],entry,stop,stop,target,budget,size,ts,cost,json.dumps(cfg),VERSION))
+    events.append(dict(evento='abriu',estrategia=estr,nome=cfg['nome'],symbol=symbol,tf=tf,direcao=signal['direcao'],entrada=entry,sl=stop,tp=target,risco=budget))
+    return events
 
 
-def processar(symbol, tf, aval, df, hora_brt):
-    """Roda as duas estrategias em paralelo neste candle. Devolve lista de eventos."""
-    if df is None or not len(df):
-        return []
-    c = _conn()
-    eventos = []
-    for estr in ESTRATEGIAS:
-        try:
-            eventos += _processar_estrategia(c, estr, symbol, tf, aval, df, hora_brt)
-        except Exception:
-            pass
-    c.close()
-    return eventos
+def processar(symbol,tf,aval,df,hora_brt,permitir_entradas=True):
+    df=validate_candles(df)
+    c=_conn()
+    events=[]
+    try:
+        for estr in ESTRATEGIAS:
+            try:
+                c.execute('BEGIN IMMEDIATE')
+                current=_processar_estrategia(c,estr,symbol,tf,aval,df,hora_brt,permitir_entradas)
+                c.commit()
+                events.extend(current)
+            except Exception:
+                c.rollback()
+                log.exception('Falha paper %s %s %s',estr,symbol,tf)
+                raise
+    finally:
+        c.close()
+    return events
 
 
-def _estado_estrategia(c, estr):
-    cfg = get_config(estr)
-    banca = _banca(c, estr)
-    abertas = c.execute(
-        "SELECT symbol, tf, direcao, entrada, sl, tp, risco_dinheiro, ts_candle, breakeven "
-        "FROM posicoes WHERE status='aberta' AND estrategia=? ORDER BY id DESC", (estr,)).fetchall()
-    fechadas = c.execute(
-        "SELECT symbol, tf, direcao, entrada, preco_saida, resultado, resultado_r, status, fechada_em, ts_candle "
-        "FROM posicoes WHERE status!='aberta' AND estrategia=? ORDER BY id DESC LIMIT 100", (estr,)).fetchall()
-    eq = c.execute("SELECT ts, banca FROM equity WHERE estrategia=? ORDER BY id ASC", (estr,)).fetchall()
-    trades_hoje, res_hoje = _stats_dia(c, estr)
-    cb_bloqueado, cb_motivo = _circuit_breaker(c, estr, cfg)
-
-    abertas = [dict(zip(["symbol", "tf", "direcao", "entrada", "sl", "tp", "risco", "ts_candle", "breakeven"], a)) for a in abertas]
-    fechadas = [dict(zip(["symbol", "tf", "direcao", "entrada", "saida", "resultado", "resultado_r", "status", "fechada_em", "ts_candle"], f)) for f in fechadas]
-    vit = [f for f in fechadas if f["resultado"] > 0]
-    total = len(fechadas)
-    equity = [{"time": ts, "value": round(b, 2)} for ts, b in eq]
-    if not equity:
-        equity = [{"time": int(dt.datetime.now().timestamp()), "value": BANCA_INICIAL}]
-    return {
-        "estrategia": estr,
-        "nome": cfg["nome"],
-        "tipo": cfg.get("tipo"),
-        "config": cfg,
-        "banca_inicial": BANCA_INICIAL,
-        "banca": round(banca, 2),
-        "retorno_pct": round((banca / BANCA_INICIAL - 1) * 100, 2),
-        "abertas": abertas,
-        "n_abertas": len(abertas),
-        "fechadas": fechadas,
-        "total_operacoes": total,
-        "vitorias": len(vit),
-        "taxa_acerto": round(len(vit) / total * 100, 1) if total else 0,
-        "equity": equity,
-        "circuit_breaker": {
-            "ativo": cfg.get("cb_ativo", False),
-            "trades_hoje": trades_hoje,
-            "max_trades_dia": cfg.get("max_trades_dia"),
-            "resultado_hoje": res_hoje,
-            "perda_max_dia_pct": cfg.get("perda_max_dia_pct"),
-            "bloqueado": cb_bloqueado,
-            "motivo": cb_motivo,
-        },
-    }
+def _estado_estrategia(c,estr):
+    cfg=get_config(estr,c)
+    bank,start,realised,exposure,dd=_risk_state(c,estr)
+    opens=[dict(r) for r in c.execute("SELECT symbol,tf,direcao,entrada,sl,tp,risco_dinheiro AS risco,ts_candle,breakeven,erro_dados,versao FROM posicoes WHERE estrategia=? AND status='aberta' ORDER BY id DESC",(estr,))]
+    closed=[dict(r) for r in c.execute("SELECT symbol,tf,direcao,entrada,preco_saida AS saida,resultado,resultado_r,status,fechada_em,ts_candle,versao FROM posicoes WHERE estrategia=? AND status!='aberta' ORDER BY id DESC LIMIT 100",(estr,))]
+    n,wins,gains,losses=c.execute("SELECT COUNT(*), COALESCE(SUM(resultado>0),0), COALESCE(SUM(CASE WHEN resultado>0 THEN resultado ELSE 0 END),0), COALESCE(SUM(CASE WHEN resultado<0 THEN -resultado ELSE 0 END),0) FROM posicoes WHERE estrategia=? AND status!='aberta'",(estr,)).fetchone()
+    equity=[dict(time=r[0],value=r[1]) for r in c.execute('SELECT ts,banca FROM equity WHERE estrategia=? ORDER BY id',(estr,))]
+    blocked,reason=_circuit_breaker(c,estr,cfg)
+    count,_=_stats_dia(c,estr)
+    return dict(estrategia=estr,nome=cfg['nome'],tipo=cfg['tipo'],config=cfg,
+                banca_inicial=BANCA_INICIAL,banca=round(bank,2),retorno_pct=round((bank/BANCA_INICIAL-1)*100,2),
+                abertas=opens,n_abertas=len(opens),fechadas=closed,total_operacoes=n,vitorias=wins,
+                taxa_acerto=round(wins/n*100,1) if n else 0,fator_lucro=round(gains/losses,3) if losses else None,
+                equity=equity or [dict(time=int(agora().timestamp()),value=BANCA_INICIAL)],
+                versao_motor=VERSION,historico_limite=100,risco_aberto=round(exposure,2),drawdown_pct=round(dd,2),
+                circuit_breaker=dict(ativo=cfg['cb_ativo'],trades_hoje=count,max_trades_dia=cfg['max_trades_dia'],resultado_hoje=round(realised,2),
+                    perda_max_dia_pct=cfg['perda_max_dia_pct'],bloqueado=blocked,motivo=reason,escopo='estrategia',banca_inicio_dia=start))
 
 
 def estado():
-    """Estado das duas estrategias. Mantem campos de topo apontando pra A (compat)."""
-    c = _conn()
-    estr_estados = {e: _estado_estrategia(c, e) for e in ESTRATEGIAS}
-    c.close()
-    a = estr_estados["A"]
-    out = dict(a)              # compat: campos de topo = estrategia A
-    out["estrategias"] = estr_estados
-    return out
+    c=_conn()
+    try:
+        states={e:_estado_estrategia(c,e) for e in ESTRATEGIAS}
+        return {**states['A'],'estrategias':states}
+    finally:
+        c.close()

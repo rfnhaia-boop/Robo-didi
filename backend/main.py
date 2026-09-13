@@ -2,11 +2,15 @@ import asyncio
 import datetime as dt
 import json
 import time
+import logging
+import os
+import secrets
 from collections import deque
 from typing import List
 
 import requests
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -19,17 +23,32 @@ from backend.config import (
 from typing import Optional
 from pydantic import BaseModel
 
-from backend.engine import carregar_avaliacao, filtro_contexto, df_para_candles, montar_travas
+from backend.engine import carregar_avaliacao, filtro_contexto, df_para_candles, montar_travas, contexto_tendencia
+from backend.execution import VERSION
 from backend.backtest import rodar_backtest
 from backend import forward
 from backend import paper
 from backend import resumo as resumo_mod
 
 app = FastAPI(title="Robo Didi Forex")
+log = logging.getLogger(__name__)
+
+
+@app.middleware('http')
+async def protect_controls(request, call_next):
+    protected = request.method not in ('GET','HEAD','OPTIONS') or request.url.path.startswith('/api/telegram')
+    if protected:
+        expected = os.environ.get('ADMIN_TOKEN','')
+        supplied = request.headers.get('X-Admin-Token','')
+        if not expected:
+            return JSONResponse({'erro':'Configure ADMIN_TOKEN no servidor para liberar controles'},status_code=503)
+        if not secrets.compare_digest(expected,supplied):
+            return JSONResponse({'erro':'Acesso administrativo necessario'},status_code=401)
+    return await call_next(request)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -48,6 +67,8 @@ estado = {
     "dados": {s: {"timeframes": {}, "contexto": {"direcao": None, "estagio": 0}}
               for s in SYMBOLS},
     "precos": {},                # symbol -> ultimo preco (P&L flutuante multi-par)
+    "erros": {},
+    "versao_motor": VERSION,
 }
 
 historico_alertas: deque = deque(maxlen=100)
@@ -204,11 +225,12 @@ async def processar_symbol(symbol, agora):
     # contexto (1h)
     key_ctx = (symbol, INTERVALO_CONTEXTO)
     if agora - ultimo_fetch.get(key_ctx, 0) >= SEGUNDOS_POR_INTERVALO[INTERVALO_CONTEXTO]:
-        aval_ctx, _, _, _ = carregar_avaliacao(symbol, INTERVALO_CONTEXTO)
+        _, _, _, ctx_ind = await asyncio.to_thread(carregar_avaliacao, symbol, INTERVALO_CONTEXTO)
+        aval_ctx = contexto_tendencia(ctx_ind)
         ddata["contexto"] = aval_ctx
         if primario:
             estado["contexto"] = aval_ctx
-        ultimo_fetch[key_ctx] = agora
+        ultimo_fetch[key_ctx] = (agora // SEGUNDOS_POR_INTERVALO[INTERVALO_CONTEXTO])*SEGUNDOS_POR_INTERVALO[INTERVALO_CONTEXTO] + 5
         await asyncio.sleep(1.5)   # respeita rate limit da API
 
     # timeframes operacionais (30min)
@@ -217,26 +239,32 @@ async def processar_symbol(symbol, agora):
         if agora - ultimo_fetch.get(key, 0) < SEGUNDOS_POR_INTERVALO[tf]:
             continue
 
-        aval, ts, df, df_ind = carregar_avaliacao(symbol, tf)
+        aval, ts, df, df_ind = await asyncio.to_thread(carregar_avaliacao, symbol, tf)
         aval = filtro_contexto(aval, ddata["contexto"])
-        aval["guarda"] = montar_travas(aval, dt.datetime.now().hour)
-        ultimo_fetch[key] = agora
+        aval["guarda"] = montar_travas(aval, paper.agora().hour)
 
         candles = df_para_candles(df, df_ind)
         ddata["timeframes"][tf] = {"aval": aval, "ts": str(ts), "candles": candles}
         estado["precos"][symbol] = aval.get("preco")
-        estado["ultimo_update"] = dt.datetime.now().isoformat()
+        estado["ultimo_update"] = paper.agora().isoformat()
         if primario:
             estado["timeframes"][tf] = ddata["timeframes"][tf]
 
         try:
             forward.verificar(symbol, tf, df)
         except Exception:
-            pass
+            log.exception('Falha no forward para %s %s', symbol, tf)
 
         # paper trading: abre/fecha posicoes virtuais ao vivo (todos os instrumentos)
         try:
-            eventos = paper.processar(symbol, tf, aval, df, dt.datetime.now().hour)
+            # A stale feed may resolve known exits, but must never create entries.
+            candle_end = ts + dt.timedelta(seconds=SEGUNDOS_POR_INTERVALO[tf])
+            age = (dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)-candle_end).total_seconds()
+            fresh = 0 <= age <= 180
+            eventos = paper.processar(symbol, tf, aval, df, paper.agora().hour,
+                                     permitir_entradas=estado['monitorando'] and fresh)
+            ultimo_fetch[key] = (agora // SEGUNDOS_POR_INTERVALO[tf])*SEGUNDOS_POR_INTERVALO[tf] + 5
+            estado['erros'].pop(symbol, None)
             for evt in (eventos or []):
                 await broadcast({"tipo": "paper", "operacao": evt, "estado": paper.estado()})
                 est = evt.get("nome", evt.get("estrategia", ""))
@@ -245,7 +273,7 @@ async def processar_symbol(symbol, agora):
                     enviar_telegram(
                         f"{emoji} <b>[{est}] ABRIR {evt['direcao'].upper()}</b> | {symbol} {tf}\n"
                         f"Entrada: {evt['entrada']}\nStop: {evt['sl']}\nAlvo: {evt['tp']}\n"
-                        f"Risco: ${evt['risco']}\n(operacao simulada — copie manualmente)")
+                        f"Risco: ${evt['risco']}\n(simulacao experimental; nao e ordem para copiar)")
                 elif evt["evento"] == "fechou":
                     ico = "✅" if evt["status"] == "alvo" else ("➖" if evt["status"] == "breakeven" else "❌")
                     sinal = "+" if evt["resultado"] >= 0 else ""
@@ -259,7 +287,8 @@ async def processar_symbol(symbol, agora):
                         f"Parei de operar hoje: {evt['motivo']}.\n"
                         f"Banca: ${evt['banca']} (protegendo o capital)")
         except Exception:
-            pass
+            log.exception('Falha no paper para %s %s', symbol, tf)
+            raise
 
         # update do grafico: so do instrumento primario (frontend mostra um por vez)
         if primario:
@@ -287,10 +316,13 @@ async def processar_symbol(symbol, agora):
             historico_alertas.appendleft(alerta)
             await broadcast({"tipo": "alerta", "alerta": alerta})
 
-            try:
-                forward.registrar(alerta, df)
-            except Exception:
-                pass
+            # Research ledger measures only the same executable Didi setup.
+            if (aval['estagio'] >= 3 and aval.get('contexto_confirmado')
+                    and aval.get('guarda',{}).get('dentro_janela')):
+                try:
+                    forward.registrar(alerta, df)
+                except Exception:
+                    log.exception('Falha ao registrar forward %s %s', symbol, tf)
 
             emoji = "🟢" if aval["direcao"] == "compra" else "🔴"
             msg_tg = (
@@ -312,15 +344,13 @@ async def processar_symbol(symbol, agora):
 
 async def loop_monitoramento():
     while True:
-        if not estado["monitorando"]:
-            await asyncio.sleep(2)
-            continue
-
         agora = time.time()
         for symbol in estado["symbols"]:
             try:
                 await processar_symbol(symbol, agora)
             except Exception as e:
+                estado['erros'][symbol] = {'hora':paper.agora().isoformat(),'erro':str(e)}
+                log.exception('Falha no monitoramento de %s', symbol)
                 await broadcast({"tipo": "erro", "symbol": symbol, "msg": str(e)})
 
         await asyncio.sleep(POLL_SEGUNDOS)
@@ -346,7 +376,7 @@ async def loop_resumo_diario():
     global ultimo_resumo_enviado
     while True:
         try:
-            agora = dt.datetime.now()
+            agora = paper.agora()
             if (agora.hour == HORA_RESUMO and agora.minute >= MIN_RESUMO
                     and ultimo_resumo_enviado != agora.date()):
                 r = montar_resumo_atual()
@@ -372,6 +402,9 @@ async def startup():
 @app.get("/api/status")
 def status():
     return {
+        "versao_motor": VERSION,
+        "erros": estado['erros'],
+        "pausa_escopo": "novas entradas; saidas continuam",
         "symbol": estado["symbol"],
         "symbols": estado["symbols"],
         "precos": estado["precos"],
@@ -446,15 +479,19 @@ class PaperConfig(BaseModel):
     max_trades_dia: Optional[int] = None
     perda_max_dia_pct: Optional[float] = None
     max_posicoes: Optional[int] = None
+    exposicao_max_pct: Optional[float] = None
+    drawdown_max_pct: Optional[float] = None
+    spread_stop_max: Optional[float] = None
+    slippage_spreads: Optional[float] = None
 
 
 @app.post("/api/paper/config")
 def paper_set_config(cfg: PaperConfig, estrategia: str = "A"):
     try:
-        novo = {k: v for k, v in cfg.dict().items() if v is not None}
+        novo = {k: v for k, v in cfg.model_dump().items() if v is not None}
         return paper.set_config(estrategia.upper(), novo)
     except Exception as e:
-        return {"erro": str(e)}
+        return JSONResponse({"erro": str(e)},status_code=422)
 
 
 @app.post("/api/paper/reset")
@@ -463,7 +500,7 @@ def paper_reset(estrategia: Optional[str] = None):
         paper.resetar(estrategia.upper() if estrategia else None)
         return paper.estado()
     except Exception as e:
-        return {"erro": str(e)}
+        return JSONResponse({"erro": str(e)},status_code=409)
 
 
 # ==========================================================================

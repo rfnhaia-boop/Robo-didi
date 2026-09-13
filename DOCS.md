@@ -181,6 +181,8 @@ Credenciais ficam em **variáveis de ambiente** do serviço, em
 [Service]
 Environment="TELEGRAM_BOT_TOKEN=<token>"
 Environment="TELEGRAM_CHAT_ID=<chat_id>"
+Environment="TWELVE_DATA_API_KEY=<nova_chave>"
+Environment="ADMIN_TOKEN=<senha_longa_e_aleatoria>"
 ```
 O `config.py` lê de `os.environ`. Após editar, recarregue:
 ```bash

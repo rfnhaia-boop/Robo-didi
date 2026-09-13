@@ -250,6 +250,7 @@ def sinal_smc(df, lookback=10):
 
 
 def filtro_contexto(aval_op, aval_ctx):
+    aval_op['contexto_confirmado'] = bool(aval_op.get('direcao') and aval_op.get('direcao') == aval_ctx.get('direcao'))
     if aval_op["direcao"] is None or aval_ctx["direcao"] is None:
         aval_op["contra_tendencia"] = False
         return aval_op
@@ -260,11 +261,26 @@ def filtro_contexto(aval_op, aval_ctx):
     return aval_op
 
 
+def contexto_tendencia(df_ind):
+    """Direction from closed-bar trend, not from a rare crossing event."""
+    if len(df_ind) < 25:
+        return {"direcao": None, "estagio": 0}
+    ma = df_ind['close'].rolling(20).mean()
+    price = float(df_ind['close'].iloc[-1])
+    slope = float(ma.iloc[-1] - ma.iloc[-4])
+    direction = ('compra' if price > ma.iloc[-1] and slope > 0 else
+                 'venda' if price < ma.iloc[-1] and slope < 0 else None)
+    return {"direcao": direction, "estagio": 0, "preco": price,
+            "metodo": "SMA20 + inclinacao em candles fechados"}
+
+
 # ==========================================================================
 #  DADOS
 # ==========================================================================
 
 def buscar_candles(symbol, interval, outputsize=OUTPUTSIZE):
+    if not TWELVE_DATA_API_KEY:
+        raise RuntimeError("Configure TWELVE_DATA_API_KEY no ambiente do servico")
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol,
@@ -275,6 +291,7 @@ def buscar_candles(symbol, interval, outputsize=OUTPUTSIZE):
         "format": "JSON",
     }
     r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
     data = r.json()
     if data.get("status") == "error" or "values" not in data:
         raise RuntimeError(f"Twelve Data: {data.get('message', data)}")
@@ -283,8 +300,11 @@ def buscar_candles(symbol, interval, outputsize=OUTPUTSIZE):
     df = df.astype({"open": float, "high": float, "low": float, "close": float})
     df["datetime"] = pd.to_datetime(df["datetime"])
     df = df.sort_values("datetime").reset_index(drop=True)
-    df = df.iloc[:-1].reset_index(drop=True)
-    return df[["datetime", "open", "high", "low", "close"]]
+    from backend.execution import INTERVAL_SECONDS, validate_candles
+    seconds = INTERVAL_SECONDS[interval]
+    now = pd.Timestamp.now(tz='UTC').tz_localize(None)
+    df = df[df['datetime'] + pd.Timedelta(seconds=seconds) <= now].reset_index(drop=True)
+    return validate_candles(df[["datetime", "open", "high", "low", "close"]])
 
 
 def carregar_avaliacao(symbol, interval):

@@ -36,6 +36,7 @@ COMO COLOCAR PRA RODAR (passo a passo)
 """
 
 import sys
+import os
 import time
 import datetime as dt
 
@@ -48,7 +49,7 @@ import requests
 #  CONFIGURACAO  -  edite aqui
 # ==========================================================================
 
-TWELVE_DATA_API_KEY = "b8a2f2f6f54a47cdab5b8b314da1f9cd"
+TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "")
 
 TELEGRAM_BOT_TOKEN = "COLE_O_TOKEN_DO_BOT_AQUI"
 TELEGRAM_CHAT_ID   = "COLE_O_CHAT_ID_AQUI"

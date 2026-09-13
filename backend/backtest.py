@@ -1,225 +1,135 @@
-"""Backtest do setup Didi sobre candles historicos.
+"""Research simulator using the same entry and OHLC exit functions as paper.
 
-Simula: a cada gatilho (estagio >= minimo) entra na abertura do candle
-seguinte, com stop na minima/maxima recente e alvo em RR x risco.
-Sai por stop, alvo ou agulhada contraria. Risco fixo de X% da banca.
+Single-instrument research, not a multi-instrument portfolio forecast.
+Entry is modelled at signal close plus explicit costs; not a broker fill.
 """
-
-import numpy as np
 import pandas as pd
-
-from backend.engine import buscar_candles, montar_indicadores
-from backend.config import BW_LOOKBACK, BW_PERCENTIL
-
-
-def _sinal_no_candle(d, i):
-    """Replica a logica do avaliar() para o candle de indice i."""
-    dc, dl = d["didi_curta"], d["didi_longa"]
-    if np.isnan(dc[i]) or np.isnan(dl[i]) or np.isnan(d["bb_bw"][i]) or i < BW_LOOKBACK + 2:
-        return None, 0, False
-
-    agulhada_compra = dc[i - 1] <= dl[i - 1] and dc[i] > dl[i]
-    agulhada_venda  = dc[i - 1] >= dl[i - 1] and dc[i] < dl[i]
-
-    dist_atual = abs(dc[i] - dl[i])
-    dist_ant   = abs(dc[i - 1] - dl[i - 1])
-    convergindo = dist_atual < dist_ant
-    std = d["didi_std"][i]
-    perto = dist_atual < (std * 0.6 if std and not np.isnan(std) else 1e9)
-
-    limiar = d["bw_limiar"][i]
-    em_squeeze = (not np.isnan(limiar)) and d["bb_bw"][i] <= limiar
-    expandindo = d["bb_bw"][i] > d["bb_bw"][i - 1]
-
-    trix_compra = d["trix"][i] > d["trix_sinal"][i] and d["trix"][i] > d["trix"][i - 1]
-    trix_venda  = d["trix"][i] < d["trix_sinal"][i] and d["trix"][i] < d["trix"][i - 1]
-    estoc_compra = d["estoc_k"][i] > d["estoc_d"][i] and d["estoc_k"][i] < 80
-    estoc_venda  = d["estoc_k"][i] < d["estoc_d"][i] and d["estoc_k"][i] > 20
-    adx_forte = (not np.isnan(d["adx"][i])) and d["adx"][i] > 25 and d["adx"][i] > d["adx"][i - 1]
-
-    direcao, estagio = None, 0
-    conf_c = sum([trix_compra, estoc_compra, expandindo, adx_forte])
-    conf_v = sum([trix_venda, estoc_venda, expandindo, adx_forte])
-
-    if agulhada_compra:
-        direcao, estagio = "compra", (3 if conf_c >= 3 else 2)
-    elif agulhada_venda:
-        direcao, estagio = "venda", (3 if conf_v >= 3 else 2)
-    elif convergindo and perto and em_squeeze:
-        direcao = "compra" if dc[i] < dl[i] else "venda"
-        estagio = 1
-
-    agulhada = agulhada_compra or agulhada_venda
-    return direcao, estagio, agulhada
+from backend.engine import buscar_candles, montar_indicadores, avaliar, filtro_contexto, contexto_tendencia
+from backend.execution import VERSION, INTERVAL_SECONDS, validate_candles, advance, size_position, pnl
+from backend.strategy import entry_signal, market_open
+from backend.config import SPREADS
 
 
-def rodar_backtest(symbol, interval, estagio_min=2, rr=1.5, risco_pct=1.0,
-                   hora_ini=None, hora_fim=None, usar_adx=True, outputsize=5000,
-                   breakeven=False, df_pronto=None, spread_preco=None):
-    # custo por operacao (ida e volta) em unidades de preco
-    if spread_preco is None:
-        spread_preco = 0.0005 if "BRL" in symbol.upper() else 0.00012
-    if df_pronto is not None:
-        df = df_pronto.copy()
+def prepare(df,interval):
+    raw=validate_candles(df)
+    # Never treat out-of-session vendor bars as actual FX executions.
+    ind=montar_indicadores(raw[['datetime','open','high','low','close']])
+    context=raw.set_index('datetime').resample('1h',label='left',closed='left').agg(
+        {'open':'first','high':'max','low':'min','close':'last'})
+    counts=raw.set_index('datetime').close.resample('1h').count()
+    expected=max(1,3600//INTERVAL_SECONDS[interval])
+    context=context[counts>=expected].dropna().reset_index()
+    ctx=montar_indicadores(context)
+    signals=[]
+    for i in range(len(ind)):
+        if i<60:
+            signals.append({})
+            continue
+        prefix=ind.iloc[:i+1]
+        end=ind.datetime.iloc[i]+pd.Timedelta(seconds=INTERVAL_SECONDS[interval])
+        eligible=ctx[ctx.datetime+pd.Timedelta(hours=1)<=end]
+        av=avaliar(prefix)
+        av=filtro_contexto(av,contexto_tendencia(eligible))
+        signals.append(av)
+    return ind,signals
+
+
+def rodar_backtest(symbol,interval,estagio_min=3,rr=3.0,risco_pct=0.25,
+                  hora_ini=8,hora_fim=13,usar_adx=True,outputsize=5000,
+                  breakeven=True,df_pronto=None,spread_preco=None,
+                  tipo='didi',prepared=None,start_index=60,end_index=None,
+                  custo_multiplicador=1.0):
+    if symbol not in SPREADS or interval not in INTERVAL_SECONDS:
+        raise ValueError('Ativo ou timeframe sem custos configurados')
+    if not 0.01<=risco_pct<=2 or not 0.5<=rr<=10 or custo_multiplicador<1:
+        raise ValueError('Parametros de risco invalidos')
+    if not usar_adx:
+        raise ValueError('Filtro ADX obrigatorio para comparabilidade do Didi')
+    spread=SPREADS[symbol] if spread_preco is None else spread_preco
+    cost=spread*1.5*custo_multiplicador
+    if prepared is None:
+        df=df_pronto if df_pronto is not None else buscar_candles(symbol,interval,outputsize)
+        df=validate_candles(df)
+        df=df[[market_open(symbol,t) for t in df.datetime]].reset_index(drop=True)
+        ind,signals=prepare(df,interval)
     else:
-        df = buscar_candles(symbol, interval, outputsize=outputsize)
-        df = montar_indicadores(df)
-
-    # series auxiliares pre-computadas
-    df["didi_std"] = df["didi_curta"].rolling(20).std()
-    df["bw_limiar"] = df["bb_bw"].rolling(BW_LOOKBACK).quantile(BW_PERCENTIL / 100.0)
-
-    d = {col: df[col].values for col in
-         ["open", "high", "low", "close", "didi_curta", "didi_longa", "bb_bw",
-          "trix", "trix_sinal", "estoc_k", "estoc_d", "adx", "didi_std", "bw_limiar"]}
-    datas = df["datetime"].values
-    n = len(df)
-
-    banca_inicial = 10000.0
-    banca = banca_inicial
-    equity = [{"time": int(pd.Timestamp(datas[0]).timestamp()), "value": banca}]
-    trades = []
-    posicao = None  # dict: dir, entrada, sl, tp, idx_entrada
-
-    def hora_brt(idx):
-        return (pd.Timestamp(datas[idx]).hour - 3) % 24
-
-    def dentro_horario(idx):
-        if hora_ini is None or hora_fim is None:
-            return True
-        h = hora_brt(idx)
-        if hora_ini <= hora_fim:
-            return hora_ini <= h < hora_fim
-        return h >= hora_ini or h < hora_fim  # janela cruzando meia-noite
-
-    def fechar(idx, preco_saida, motivo):
-        nonlocal banca, posicao
-        p = posicao
-        risco_preco = abs(p["entrada"] - p.get("sl_original", p["sl"]))
-        if risco_preco <= 0:
-            posicao = None
-            return
-        if p["dir"] == "compra":
-            resultado_preco = preco_saida - p["entrada"]
-        else:
-            resultado_preco = p["entrada"] - preco_saida
-        resultado_preco -= spread_preco                      # custo da operacao
-        resultado_r = resultado_preco / risco_preco          # em multiplos de risco
-        resultado_dinheiro = banca * (risco_pct / 100.0) * resultado_r
-        banca += resultado_dinheiro
-        trades.append({
-            "data": str(pd.Timestamp(datas[idx]))[:16],
-            "dir": p["dir"],
-            "entrada": round(p["entrada"], 5),
-            "saida": round(preco_saida, 5),
-            "resultado_r": round(resultado_r, 2),
-            "resultado": round(resultado_dinheiro, 2),
-            "motivo": motivo,
-            "estagio": p["estagio"],
-        })
-        equity.append({"time": int(pd.Timestamp(datas[idx]).timestamp()), "value": round(banca, 2)})
-        posicao = None
-
-    for i in range(BW_LOOKBACK + 3, n - 1):
-        # gestao da posicao aberta
-        if posicao is not None:
-            p = posicao
-            hi, lo = d["high"][i], d["low"][i]
-            if p["dir"] == "compra":
-                if lo <= p["sl"]:
-                    fechar(i, p["sl"], "breakeven" if p.get("be") else "stop")
-                elif hi >= p["tp"]:
-                    fechar(i, p["tp"], "alvo")
-                elif breakeven and not p.get("be"):
-                    risco = p["entrada"] - p["sl_original"]
-                    if hi >= p["entrada"] + risco:   # andou +1R -> stop no zero a zero
-                        p["sl"] = p["entrada"]
-                        p["be"] = True
-            else:
-                if hi >= p["sl"]:
-                    fechar(i, p["sl"], "breakeven" if p.get("be") else "stop")
-                elif lo <= p["tp"]:
-                    fechar(i, p["tp"], "alvo")
-                elif breakeven and not p.get("be"):
-                    risco = p["sl_original"] - p["entrada"]
-                    if lo <= p["entrada"] - risco:
-                        p["sl"] = p["entrada"]
-                        p["be"] = True
-
-        direcao, estagio, agulhada = _sinal_no_candle(d, i)
-
-        # agulhada contraria fecha posicao
-        if posicao is not None and agulhada and direcao != posicao["dir"]:
-            fechar(i, d["close"][i], "agulhada contraria")
-
-        # entrada
-        if posicao is None and direcao and estagio >= estagio_min and dentro_horario(i):
-            entrada = d["open"][i + 1]
-            janela_lo = d["low"][max(0, i - 4):i + 1].min()
-            janela_hi = d["high"][max(0, i - 4):i + 1].max()
-            if direcao == "compra":
-                sl = janela_lo
-                if entrada - sl <= 0:
-                    continue
-                tp = entrada + rr * (entrada - sl)
-            else:
-                sl = janela_hi
-                if sl - entrada <= 0:
-                    continue
-                tp = entrada - rr * (sl - entrada)
-            posicao = {"dir": direcao, "entrada": entrada, "sl": sl, "tp": tp,
-                       "sl_original": sl, "idx": i + 1, "estagio": estagio}
-
-    # fecha posicao pendurada no fim
-    if posicao is not None:
-        fechar(n - 1, d["close"][n - 1], "fim do periodo")
-
-    # estatisticas
-    ganhos = [t["resultado"] for t in trades if t["resultado"] > 0]
-    perdas = [t["resultado"] for t in trades if t["resultado"] <= 0]
-    total = len(trades)
-    fator = (sum(ganhos) / abs(sum(perdas))) if perdas and sum(perdas) != 0 else (float('inf') if ganhos else 0)
-
-    # drawdown maximo sobre a curva de equity
-    pico, dd_max = banca_inicial, 0.0
-    for ponto in equity:
-        pico = max(pico, ponto["value"])
-        dd = (pico - ponto["value"]) / pico * 100
-        dd_max = max(dd_max, dd)
-
-    # comportamento por periodos (mes a mes)
-    mensal = {}
+        ind,signals=prepared
+    end_index=len(ind) if end_index is None else min(end_index,len(ind))
+    if end_index-start_index<2:
+        raise ValueError('Historico insuficiente depois do aquecimento')
+    cfg=dict(tipo=tipo,estagio_min=estagio_min,lookback=10)
+    bank=peak=10000.0
+    equity=[dict(time=int(ind.datetime.iloc[start_index].timestamp()),value=bank)]
+    trades=[]
+    position=None
+    day=None
+    day_start=bank
+    daily_trades=0
+    halted=False
+    def close(bar,price,status):
+        nonlocal bank,position,peak,halted
+        result,r=pnl(position,price,cost)
+        bank=round(bank+round(result,2),2)
+        peak=max(peak,bank)
+        halted=halted or (peak-bank)/peak>=0.10
+        trades.append(dict(data=str(bar.datetime),dir=position['direcao'],entrada=position['entrada'],
+                           saida=price,resultado=round(result,2),resultado_r=round(r,4),motivo=status,
+                           estagio=position.get('estagio',0)))
+        equity.append(dict(time=int(bar.datetime.timestamp()),value=bank))
+        position=None
+    for i in range(max(60,start_index),end_index):
+        bar=ind.iloc[i]
+        end=bar.datetime+pd.Timedelta(seconds=INTERVAL_SECONDS[interval])
+        local=end-pd.Timedelta(hours=3)
+        if local.date()!=day:
+            day=local.date()
+            day_start=bank
+            daily_trades=0
+        if position is not None:
+            position,event=advance(position,bar,breakeven)
+            if event:
+                close(bar,event[1],event[0])
+        if position or halted or not market_open(symbol,end):
+            continue
+        if hora_ini is not None and hora_fim is not None and not hora_ini<=local.hour<hora_fim:
+            continue
+        budget=round(bank*risco_pct/100,2)
+        if daily_trades>=3 or day_start-bank+budget>=day_start*0.01-1e-8 or budget>bank*0.01:
+            continue
+        signal=entry_signal(cfg,signals[i],ind.iloc[:i+1])
+        if not signal:
+            continue
+        distance=signal['entrada']-signal['sl'] if signal['direcao']=='compra' else signal['sl']-signal['entrada']
+        if distance<=0 or spread/distance>0.20:
+            continue
+        position={**signal,'sl_original':signal['sl'],'breakeven':0,'risco_dinheiro':budget,
+                  'tamanho':size_position(signal['entrada'],signal['sl'],budget,cost),
+                  'tp':signal['entrada']+(1 if signal['direcao']=='compra' else -1)*rr*distance,
+                  'estagio':signals[i].get('estagio',0)}
+        daily_trades+=1
+    if position:
+        close(ind.iloc[end_index-1],float(ind.close.iloc[end_index-1]),'fim do periodo')
+    wins=[t['resultado'] for t in trades if t['resultado']>0]
+    losses=[t['resultado'] for t in trades if t['resultado']<0]
+    high=10000.0
+    dd=0
+    for point in equity:
+        high=max(high,point['value'])
+        dd=max(dd,(high-point['value'])/high*100)
+    monthly={}
     for t in trades:
-        mes = t["data"][:7]
-        m = mensal.setdefault(mes, {"mes": mes, "trades": 0, "vitorias": 0, "resultado": 0.0})
-        m["trades"] += 1
-        m["vitorias"] += 1 if t["resultado"] > 0 else 0
-        m["resultado"] = round(m["resultado"] + t["resultado"], 2)
-    mensal = sorted(mensal.values(), key=lambda x: x["mes"])
-
-    periodo_ini = str(pd.Timestamp(datas[0]))[:16]
-    periodo_fim = str(pd.Timestamp(datas[-1]))[:16]
-
-    return {
-        "symbol": symbol,
-        "interval": interval,
-        "periodo": f"{periodo_ini} ate {periodo_fim}",
-        "candles": n,
-        "parametros": {
-            "estagio_min": estagio_min, "rr": rr, "risco_pct": risco_pct,
-            "hora_ini": hora_ini, "hora_fim": hora_fim,
-        },
-        "banca_inicial": banca_inicial,
-        "banca_final": round(banca, 2),
-        "retorno_pct": round((banca / banca_inicial - 1) * 100, 2),
-        "trades": total,
-        "vitorias": len(ganhos),
-        "derrotas": len(perdas),
-        "taxa_acerto": round(len(ganhos) / total * 100, 1) if total else 0,
-        "fator_lucro": round(fator, 2) if fator != float('inf') else None,
-        "drawdown_max_pct": round(dd_max, 2),
-        "spread_usado": spread_preco,
-        "mensal": mensal,
-        "equity": equity,
-        "lista_trades": trades[-100:],
-    }
+        key=t['data'][:7]
+        m=monthly.setdefault(key,dict(mes=key,trades=0,vitorias=0,resultado=0))
+        m['trades']+=1
+        m['vitorias']+=int(t['resultado']>0)
+        m['resultado']=round(m['resultado']+t['resultado'],2)
+    return dict(symbol=symbol,interval=interval,versao_motor=VERSION,
+                periodo=f'{ind.datetime.iloc[start_index]} ate {ind.datetime.iloc[end_index-1]}',candles=end_index-start_index,
+                parametros=dict(tipo=tipo,estagio_min=estagio_min,rr=rr,risco_pct=risco_pct,hora_ini=hora_ini,hora_fim=hora_fim,breakeven=breakeven),
+                banca_inicial=10000,banca_final=bank,retorno_pct=round((bank/10000-1)*100,2),
+                trades=len(trades),vitorias=len(wins),derrotas=len(losses),taxa_acerto=round(len(wins)/len(trades)*100,1) if trades else 0,
+                fator_lucro=round(sum(wins)/abs(sum(losses)),3) if losses else None,drawdown_max_pct=round(dd,2),
+                spread_usado=spread,custo_total_por_unidade=cost,mensal=list(monthly.values()),equity=equity,lista_trades=trades[-100:],
+                todos_trades=trades,parou_por_drawdown=halted,
+                limitacoes=['Simulacao de fechamento, nao execucao em corretora','Custos estimados fixos; sem swap/funding',
+                            'Teste por ativo; nao reproduz concorrencia entre ativos da carteira','DD realizado, nao intrabar'])

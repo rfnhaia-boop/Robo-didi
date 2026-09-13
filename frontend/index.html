@@ -3753,7 +3753,7 @@ function trocarInstrumento(sym) {
   if (sym === symbolAtual) return;
   symbolAtual = sym;
   renderInstSelector();
-  fetch(`/api/par/${encodeURIComponent(sym)}`, { method: 'POST' }).catch(() => {});
+  adminFetch(`/api/par/${encodeURIComponent(sym)}`, { method: 'POST' }).catch(() => {});
   // carrega os candles ja coletados desse instrumento e redesenha
   const tf = tfAtivo || '30min';
   fetch(`/api/candles/${tf}?symbol=${encodeURIComponent(sym)}`).then(r => r.json()).then(d => {
@@ -5178,8 +5178,22 @@ function renderEquityOp(equity) {
   chartOpEquity.timeScale().fitContent();
 }
 
+async function adminFetch(url, options = {}) {
+  let token = sessionStorage.getItem('roboDidiAdminToken');
+  if (!token) token = prompt('Informe a senha administrativa do painel:') || '';
+  const headers = { ...(options.headers || {}), 'X-Admin-Token': token };
+  let response = await fetch(url, { ...options, headers });
+  if (response.status === 401) {
+    sessionStorage.removeItem('roboDidiAdminToken');
+    token = prompt('Senha incorreta. Informe novamente:') || '';
+    response = await fetch(url, { ...options, headers: { ...headers, 'X-Admin-Token': token } });
+  }
+  if (response.ok) sessionStorage.setItem('roboDidiAdminToken', token);
+  return response;
+}
+
 async function togglePaper() {
-  await fetch(`/api/paper/config?estrategia=${opEstr}`, {
+  await adminFetch(`/api/paper/config?estrategia=${opEstr}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ativo: !paperLigado }),
   });
@@ -5195,30 +5209,28 @@ async function salvarPaperConfig() {
     tf: document.getElementById('op-cfg-tf').value,
     breakeven: document.getElementById('op-cfg-be').value === 'sim',
   };
-  await fetch(`/api/paper/config?estrategia=${opEstr}`, {
+  await adminFetch(`/api/paper/config?estrategia=${opEstr}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(cfg),
   });
 }
 
 async function resetPaper() {
-  if (!confirm(`Zerar a banca virtual da estratégia ${opEstr} e apagar seu histórico?`)) return;
-  await fetch(`/api/paper/reset?estrategia=${opEstr}`, { method: 'POST' });
-  atualizarOperacao();
+  alert('O histórico está protegido. Uma nova campanha deve usar um banco separado e identificado por versão.');
 }
 
-// presets ranqueados por consistência (retorno ÷ perda) — validados no otimizador
+// referências históricas antigas; não representam promessa ou configuração aprovada
 const TOP_PADROES = [
-  { titulo: 'Campeão Validado', symbol: 'EUR/USD', interval: '30min', estagio: 3, rr: 3,   risco: 1, h1: 8, h2: 13,
+  { titulo: 'Didi histórico (amostra insuficiente)', symbol: 'EUR/USD', interval: '30min', estagio: 3, rr: 3,   risco: 0.25, h1: 8, h2: 13,
     ret: '+9,7%', dd: '4,8%', cor: 'var(--compra)', glow: 'var(--compra-glow)',
     nota: 'Único que sobreviveu ao walk-forward (teste fora da amostra)' },
-  { titulo: 'Menos Perda', symbol: 'EUR/USD', interval: '30min', estagio: 3, rr: 2.5, risco: 1, h1: 8, h2: 13,
+  { titulo: 'Exploração histórica — sem validação', symbol: 'EUR/USD', interval: '30min', estagio: 3, rr: 2.5, risco: 0.25, h1: 8, h2: 13,
     ret: '+7,2%', dd: '3,2%', cor: 'var(--azul)', glow: 'var(--azul-glow)',
     nota: 'Drawdown mínimo — prioriza segurança sobre lucro' },
-  { titulo: 'Janela Curta', symbol: 'EUR/USD', interval: '30min', estagio: 3, rr: 3, risco: 1, h1: 9, h2: 12,
+  { titulo: 'Janela curta — sem validação', symbol: 'EUR/USD', interval: '30min', estagio: 3, rr: 3, risco: 0.25, h1: 9, h2: 12,
     ret: '+6,5%', dd: '3,1%', cor: 'var(--azul)', glow: 'var(--azul-glow)',
     nota: 'Só o pico de liquidez Londres+NY (9h-12h)' },
-  { titulo: 'EUR/BRL Otimizado', symbol: 'EUR/BRL', interval: '15min', estagio: 3, rr: 3, risco: 1, h1: 8, h2: 13,
+  { titulo: 'EUR/BRL legado — fora da campanha', symbol: 'EUR/BRL', interval: '15min', estagio: 3, rr: 3, risco: 0.25, h1: 8, h2: 13,
     ret: '+5,4%', dd: '4,3%', cor: 'var(--roxo)', glow: 'var(--roxo-glow)',
     nota: 'Melhor config para o par nacional (spread maior)' },
 ];
@@ -5276,7 +5288,7 @@ async function rodarBacktest() {
   };
 
   try {
-    const r = await fetch('/api/backtest', {
+    const r = await adminFetch('/api/backtest', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(params),
@@ -5508,7 +5520,7 @@ function conectar() {
 function trocarPar() {
   const val = document.getElementById('inp-par').value.trim();
   if (!val) return;
-  fetch(`/api/par/${encodeURIComponent(val)}`, { method: 'POST' });
+  adminFetch(`/api/par/${encodeURIComponent(val)}`, { method: 'POST' });
   symbolAtual = val.toUpperCase();
   dadosTfs = {};
   document.getElementById('estagios').innerHTML = '';
@@ -5518,7 +5530,7 @@ function trocarPar() {
 
 // ===== Telegram: gerenciar destinatarios =====
 function tgCarregar() {
-  fetch('/api/telegram/chats').then(r => r.json()).then(d => {
+  adminFetch('/api/telegram/chats').then(r => r.json()).then(d => {
     const el = document.getElementById('tg-lista');
     if (!el) return;
     const extras = d.extras || [];
@@ -5539,7 +5551,7 @@ function tgCarregar() {
 function tgBuscarPendentes() {
   const el = document.getElementById('tg-pendentes');
   el.innerHTML = '<div style="font-size:12px;color:var(--texto-secondary);">Buscando...</div>';
-  fetch('/api/telegram/pendentes').then(r => r.json()).then(d => {
+  adminFetch('/api/telegram/pendentes').then(r => r.json()).then(d => {
     const p = d.pendentes || [];
     if (!p.length) {
       el.innerHTML = '<div style="font-size:12px;color:var(--vigiar);">Ninguém falou com o bot ainda. Peça pra pessoa abrir @RodoDidiOficial_bot e mandar "oi".</div>';
@@ -5556,17 +5568,17 @@ function tgBuscarPendentes() {
 }
 
 function tgAdd(id, nome) {
-  fetch('/api/telegram/add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, nome }) })
+  adminFetch('/api/telegram/add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, nome }) })
     .then(() => { tgCarregar(); document.getElementById('tg-pendentes').innerHTML = '<div style="font-size:12px;color:var(--compra);">✅ Adicionado! A pessoa já vai receber os próximos sinais.</div>'; });
 }
 
 function tgRemove(id) {
-  fetch('/api/telegram/remove', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) }).then(() => tgCarregar());
+  adminFetch('/api/telegram/remove', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) }).then(() => tgCarregar());
 }
 
 function togglePausar() {
   monitorando = !monitorando;
-  fetch(`/api/${monitorando ? 'retomar' : 'pausar'}`, { method: 'POST' });
+  adminFetch(`/api/${monitorando ? 'retomar' : 'pausar'}`, { method: 'POST' });
   const btn = document.getElementById('btn-pausar');
   btn.innerHTML = monitorando ? '<i data-lucide="pause"></i> Pausar' : '<i data-lucide="play"></i> Retomar';
   btn.className = monitorando ? 'btn-warn' : 'btn-ok';
