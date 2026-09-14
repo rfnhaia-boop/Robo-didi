@@ -66,7 +66,7 @@ def adx_ind(high, low, close, periodo=14):
     minus_di = 100 * minus_dm.ewm(alpha=1 / periodo, adjust=False).mean() / atr
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
     adx = dx.ewm(alpha=1 / periodo, adjust=False).mean()
-    return pd.DataFrame({"adx": adx})
+    return pd.DataFrame({"adx": adx, "di_plus": plus_di, "di_minus": minus_di})
 
 
 def rsi_ind(close, periodo=14):
@@ -109,14 +109,30 @@ def _cruzou_baixo(a, b):
     return (a.iloc[-2] >= b.iloc[-2]) and (a.iloc[-1] < b.iloc[-1])
 
 
+def _cruzou_cima_confirmada(a, b):
+    """Regra classica do Didi: espera 1 candle a mais depois do cruzamento
+    pra confirmar que nao foi falso rompimento. Cruzou no candle -2, e o
+    candle -1 (o mais recente) ainda tem que estar do lado comprado."""
+    return (a.iloc[-3] <= b.iloc[-3]) and (a.iloc[-2] > b.iloc[-2]) and (a.iloc[-1] > b.iloc[-1])
+
+
+def _cruzou_baixo_confirmada(a, b):
+    return (a.iloc[-3] >= b.iloc[-3]) and (a.iloc[-2] < b.iloc[-2]) and (a.iloc[-1] < b.iloc[-1])
+
+
 def avaliar(df):
     if len(df) < BW_LOOKBACK + 5:
         return {"direcao": None, "estagio": 0, "componentes": {}, "preco": None}
 
     c, p = df.iloc[-1], df.iloc[-2]
 
-    agulhada_compra = _cruzou_cima(df["didi_curta"], df["didi_longa"])
-    agulhada_venda  = _cruzou_baixo(df["didi_curta"], df["didi_longa"])
+    # cruzamento bruto (no candle mais recente) — so pra aviso antecipado na UI
+    agulhada_bruta_compra = _cruzou_cima(df["didi_curta"], df["didi_longa"])
+    agulhada_bruta_venda  = _cruzou_baixo(df["didi_curta"], df["didi_longa"])
+    # cruzamento CONFIRMADO (1 candle depois) — e o que vale pra entrar.
+    # Evita entrar no falso rompimento que reverte no candle seguinte.
+    agulhada_compra = _cruzou_cima_confirmada(df["didi_curta"], df["didi_longa"])
+    agulhada_venda  = _cruzou_baixo_confirmada(df["didi_curta"], df["didi_longa"])
 
     dist_atual = abs(c["didi_curta"] - c["didi_longa"])
     dist_ant   = abs(p["didi_curta"] - p["didi_longa"])
@@ -137,17 +153,28 @@ def avaliar(df):
 
     adx_forte = (not np.isnan(c["adx"])) and (c["adx"] > 25) and (c["adx"] > p["adx"])
 
+    # DI+/DI-: quem manda na forca direcional agora (parte do sistema Didi/DMI)
+    di_plus = float(c["di_plus"]) if not np.isnan(c["di_plus"]) else None
+    di_minus = float(c["di_minus"]) if not np.isnan(c["di_minus"]) else None
+    di_dominante = None
+    di_forca = 0.0
+    if di_plus is not None and di_minus is not None and (di_plus + di_minus) > 0:
+        di_dominante = "compra" if di_plus > di_minus else ("venda" if di_minus > di_plus else None)
+        di_forca = abs(di_plus - di_minus) / (di_plus + di_minus) * 100.0
+
     componentes = {
         "agulhada": "compra" if agulhada_compra else ("venda" if agulhada_venda else "nao"),
+        "agulhada_previa": "compra" if agulhada_bruta_compra else ("venda" if agulhada_bruta_venda else "nao"),
         "bollinger": "afunilado" if em_squeeze else ("expandindo" if expandindo else "neutro"),
         "trix": "compra" if trix_compra else ("venda" if trix_venda else "neutro"),
         "estocastico": "compra" if estoc_compra else ("venda" if estoc_venda else "neutro"),
         "adx": "forte" if adx_forte else "fraco",
+        "di": "compra" if di_dominante == "compra" else ("venda" if di_dominante == "venda" else "neutro"),
     }
 
     direcao, estagio = None, 0
-    conf_compra = sum([trix_compra, estoc_compra, expandindo, adx_forte])
-    conf_venda  = sum([trix_venda, estoc_venda, expandindo, adx_forte])
+    conf_compra = sum([trix_compra, estoc_compra, expandindo, adx_forte, di_dominante == "compra"])
+    conf_venda  = sum([trix_venda, estoc_venda, expandindo, adx_forte, di_dominante == "venda"])
 
     if agulhada_compra:
         direcao = "compra"
@@ -158,6 +185,8 @@ def avaliar(df):
     elif convergindo and perto and em_squeeze:
         direcao = "compra" if c["didi_curta"] < c["didi_longa"] else "venda"
         estagio = 1
+
+    confluencia = conf_compra if direcao == "compra" else (conf_venda if direcao == "venda" else 0)
 
     # Previsao: quantos candles ate as linhas do Didi se cruzarem
     # (extrapolacao linear da velocidade de aproximacao)
@@ -176,7 +205,40 @@ def avaliar(df):
             "previsao_candles": previsao_candles,
             "rsi": round(float(c["rsi"]), 1) if not np.isnan(c["rsi"]) else None,
             "atr_pct": round(float(c["atr_pct"]), 3) if not np.isnan(c["atr_pct"]) else None,
-            "adx_valor": round(float(c["adx"]), 1) if not np.isnan(c["adx"]) else None}
+            "adx_valor": round(float(c["adx"]), 1) if not np.isnan(c["adx"]) else None,
+            "di_plus": round(di_plus, 1) if di_plus is not None else None,
+            "di_minus": round(di_minus, 1) if di_minus is not None else None,
+            "di_dominante": di_dominante,
+            "di_forca": round(di_forca, 1),
+            "confluencia": confluencia}
+
+
+def score_sinal(aval):
+    """Nota 0-100 da qualidade do sinal — usada pelo scanner multi-par pra
+    escolher o candidato mais claro entre varios instrumentos no mesmo ciclo.
+    Combina: confluencia (Didi+TRIX+Estoc+ADX+DI), forca da tendencia (ADX),
+    dominancia direcional (DI) e RSI nao esticado. So faz sentido para sinais
+    de estagio 3 com direcao definida."""
+    if not aval or aval.get("estagio", 0) < 3 or not aval.get("direcao"):
+        return 0.0
+    direcao = aval["direcao"]
+    confluencia = aval.get("confluencia", 0)          # 0-5
+    adx = aval.get("adx_valor") or 0                  # forca da tendencia
+    di_forca = aval.get("di_forca") or 0               # 0-100
+    rsi = aval.get("rsi")
+
+    nota_confluencia = min(confluencia / 5.0, 1.0) * 40
+    nota_adx = min(adx / 40.0, 1.0) * 25
+    nota_di = min(di_forca / 50.0, 1.0) * 20
+
+    nota_rsi = 15.0
+    if rsi is not None:
+        if direcao == "compra" and rsi > 65:
+            nota_rsi = max(0.0, 15 * (1 - (rsi - 65) / 20))
+        elif direcao == "venda" and rsi < 35:
+            nota_rsi = max(0.0, 15 * (1 - (35 - rsi) / 20))
+
+    return round(nota_confluencia + nota_adx + nota_di + nota_rsi, 1)
 
 
 # ==========================================================================

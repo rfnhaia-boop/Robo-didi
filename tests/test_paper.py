@@ -22,7 +22,10 @@ class PaperTests(unittest.TestCase):
         d['datetime'] = pd.to_datetime(d.datetime)
         return d
 
-    def test_same_candle_does_not_open_twice(self):
+    def test_processar_never_opens_estrategia_a_directly(self):
+        # Estrategia A (Didi) so abre via o torneio multi-par (candidato_torneio
+        # + comprometer_torneio), nunca dentro de processar() — isso garante que
+        # o scanner sempre compara os candidatos de todos os pares antes de abrir.
         rows=[]
         for ts in pd.date_range('2026-09-09 05:00', periods=60, freq='30min'):
             rows.append((ts,100,102,98,100))
@@ -30,13 +33,57 @@ class PaperTests(unittest.TestCase):
         original=paper._sinal_entrada
         paper._sinal_entrada=lambda *a: {'direcao':'compra','entrada':100,'sl':98}
         try:
-            first=paper.processar('EUR/USD','30min',{},df,10)
-            second=paper.processar('EUR/USD','30min',{},df,10)
+            events=paper.processar('EUR/USD','30min',{},df,10)
         finally:
             paper._sinal_entrada=original
-        # A opens. B is suspended and C excludes EUR/USD.
-        self.assertEqual(sum(e['evento']=='abriu' for e in first),1)
-        self.assertEqual(second,[])
+        # B suspensa e C exclui EUR/USD -> nada abre; A nunca abre por aqui.
+        self.assertEqual(events,[])
+
+    def test_torneio_nao_abre_duas_vezes_no_mesmo_par(self):
+        rows=[]
+        for ts in pd.date_range('2026-09-09 05:00', periods=60, freq='30min'):
+            rows.append((ts,100,102,98,100))
+        df=self.candles(rows)
+        aval={'estagio':3,'direcao':'compra'}
+        original=paper.entry_signal
+        paper.entry_signal=lambda cfg,aval,df: {'direcao':'compra','entrada':100,'sl':98} if cfg.get('tipo')=='didi' else None
+        try:
+            candidato=paper.candidato_torneio('EUR/USD','30min',aval,df,10)
+            self.assertIsNotNone(candidato)
+            primeiro=paper.comprometer_torneio(candidato)
+            self.assertEqual(sum(e['evento']=='abriu' for e in primeiro),1)
+            # com a posicao ja aberta, nao ha mais candidato pro mesmo par
+            self.assertIsNone(paper.candidato_torneio('EUR/USD','30min',aval,df,10))
+        finally:
+            paper.entry_signal=original
+
+    def test_scanner_so_abre_no_candidato_de_maior_nota(self):
+        # Simula o cenario que o Rafael pediu: varios pares com sinal valido
+        # no mesmo ciclo, so entra no que tiver a nota mais alta (padrao mais
+        # claro / menos chance de erro).
+        rows=[]
+        for ts in pd.date_range('2026-09-09 05:00', periods=60, freq='30min'):
+            rows.append((ts,100,102,98,100))
+        df=self.candles(rows)
+        candidatos=[
+            dict(estrategia='A',symbol='EUR/USD',tf='30min',ts=str(df.datetime.iloc[-1]),hora_brt=10,
+                 signal={'direcao':'compra','entrada':100,'sl':98},score=40.0),   # abaixo do minimo (55)
+            dict(estrategia='A',symbol='GBP/USD',tf='30min',ts=str(df.datetime.iloc[-1]),hora_brt=10,
+                 signal={'direcao':'compra','entrada':100,'sl':98},score=61.0),   # vencedor
+            dict(estrategia='A',symbol='XAU/USD',tf='30min',ts=str(df.datetime.iloc[-1]),hora_brt=10,
+                 signal={'direcao':'compra','entrada':100,'sl':98},score=58.0),   # perde pro GBP
+        ]
+        cfg=paper.get_config('A')
+        minimo=cfg['nota_minima']
+        elegiveis=sorted([c for c in candidatos if c['score']>=minimo],key=lambda c:c['score'],reverse=True)
+        self.assertEqual([c['symbol'] for c in elegiveis],['GBP/USD','XAU/USD'])
+        vencedor=paper.comprometer_torneio(elegiveis[0])
+        self.assertEqual(sum(e['evento']=='abriu' for e in vencedor),1)
+        self.assertEqual(vencedor[0]['symbol'],'GBP/USD')
+        # XAU nao foi commitado (so o main.py chama comprometer_torneio pro
+        # vencedor de cada rodada); confirma que o candidato de EUR (nota
+        # baixa) nem entraria na lista de elegiveis.
+        self.assertNotIn('EUR/USD',[c['symbol'] for c in elegiveis])
 
     def test_disabled_strategy_still_resolves_exit(self):
         c=paper._conn()

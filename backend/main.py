@@ -218,9 +218,13 @@ ultimo_candle_alertado = {}
 
 async def processar_symbol(symbol, agora):
     """Busca contexto + timeframes operacionais de UM instrumento e dispara
-    paper/alertas/broadcasts. Tagueado por symbol (multi-instrumento)."""
+    paper/alertas/broadcasts. Tagueado por symbol (multi-instrumento).
+    Devolve o candidato do torneio multi-par da Estrategia A (Didi) pra este
+    instrumento neste ciclo, ou None — quem decide abrir e o chamador, depois
+    de comparar com os candidatos de TODOS os instrumentos do mesmo ciclo."""
     primario = (symbol == estado["symbol"])
     ddata = estado["dados"][symbol]
+    candidato = None
 
     # contexto (1h)
     key_ctx = (symbol, INTERVALO_CONTEXTO)
@@ -261,31 +265,21 @@ async def processar_symbol(symbol, agora):
             candle_end = ts + dt.timedelta(seconds=SEGUNDOS_POR_INTERVALO[tf])
             age = (dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)-candle_end).total_seconds()
             fresh = 0 <= age <= 180
-            eventos = paper.processar(symbol, tf, aval, df, paper.agora().hour,
+            # df_ind (com indicadores, incl. 'atr') — a estrategia trend/didi
+            # precisa do ATR; usar o mesmo dado que o backtest usa (df_ind)
+            # para o paper e o backtest ficarem consistentes.
+            hora_brt = paper.agora().hour
+            eventos = paper.processar(symbol, tf, aval, df_ind, hora_brt,
                                      permitir_entradas=estado['monitorando'] and fresh)
+            # Scanner multi-par (#6): a Estrategia A nao abre aqui (paper.processar
+            # ja pula 'didi'). So calcula o candidato deste par pro torneio —
+            # o vencedor entre todos os instrumentos do ciclo e decidido em
+            # loop_monitoramento, depois de varrer todo mundo.
+            if estado['monitorando'] and fresh:
+                candidato = paper.candidato_torneio(symbol, tf, aval, df_ind, hora_brt)
             ultimo_fetch[key] = (agora // SEGUNDOS_POR_INTERVALO[tf])*SEGUNDOS_POR_INTERVALO[tf] + 5
             estado['erros'].pop(symbol, None)
-            for evt in (eventos or []):
-                await broadcast({"tipo": "paper", "operacao": evt, "estado": paper.estado()})
-                est = evt.get("nome", evt.get("estrategia", ""))
-                if evt["evento"] == "abriu":
-                    emoji = "🟢" if evt["direcao"] == "compra" else "🔴"
-                    enviar_telegram(
-                        f"{emoji} <b>[{est}] ABRIR {evt['direcao'].upper()}</b> | {symbol} {tf}\n"
-                        f"Entrada: {evt['entrada']}\nStop: {evt['sl']}\nAlvo: {evt['tp']}\n"
-                        f"Risco: ${evt['risco']}\n(simulacao experimental; nao e ordem para copiar)")
-                elif evt["evento"] == "fechou":
-                    ico = "✅" if evt["status"] == "alvo" else ("➖" if evt["status"] == "breakeven" else "❌")
-                    sinal = "+" if evt["resultado"] >= 0 else ""
-                    enviar_telegram(
-                        f"{ico} <b>[{est}] FECHOU ({evt['status'].upper()})</b> | {symbol} {tf}\n"
-                        f"Resultado: {sinal}${evt['resultado']} ({sinal}{evt['resultado_r']}R)\n"
-                        f"Banca: ${evt['banca']}")
-                elif evt["evento"] == "bloqueado":
-                    enviar_telegram(
-                        f"🛑 <b>[{est}] CIRCUIT BREAKER</b> | {symbol}\n"
-                        f"Parei de operar hoje: {evt['motivo']}.\n"
-                        f"Banca: ${evt['banca']} (protegendo o capital)")
+            await _emitir_eventos_paper(eventos)
         except Exception:
             log.exception('Falha no paper para %s %s', symbol, tf)
             raise
@@ -341,17 +335,75 @@ async def processar_symbol(symbol, agora):
 
         await asyncio.sleep(1.5)   # respeita rate limit da API entre fetches
 
+    return candidato
+
+
+async def _emitir_eventos_paper(eventos):
+    for evt in (eventos or []):
+        await broadcast({"tipo": "paper", "operacao": evt, "estado": paper.estado()})
+        est = evt.get("nome", evt.get("estrategia", ""))
+        symbol = evt.get("symbol", "")
+        if evt["evento"] == "abriu":
+            emoji = "🟢" if evt["direcao"] == "compra" else "🔴"
+            enviar_telegram(
+                f"{emoji} <b>[{est}] ABRIR {evt['direcao'].upper()}</b> | {symbol} {evt.get('tf','')}\n"
+                f"Entrada: {evt['entrada']}\nStop: {evt['sl']}\nAlvo: {evt['tp']}\n"
+                f"Risco: ${evt['risco']}\n(simulacao experimental; nao e ordem para copiar)")
+        elif evt["evento"] == "fechou":
+            ico = "✅" if evt["status"] == "alvo" else ("➖" if evt["status"] == "breakeven" else "❌")
+            sinal = "+" if evt["resultado"] >= 0 else ""
+            enviar_telegram(
+                f"{ico} <b>[{est}] FECHOU ({evt['status'].upper()})</b> | {symbol} {evt.get('tf','')}\n"
+                f"Resultado: {sinal}${evt['resultado']} ({sinal}{evt['resultado_r']}R)\n"
+                f"Banca: ${evt['banca']}")
+        elif evt["evento"] == "bloqueado":
+            enviar_telegram(
+                f"🛑 <b>[{est}] CIRCUIT BREAKER</b> | {symbol}\n"
+                f"Parei de operar hoje: {evt['motivo']}.\n"
+                f"Banca: ${evt['banca']} (protegendo o capital)")
+
+
+async def resolver_torneio(candidatos):
+    """Scanner multi-par: entre todos os candidatos coletados neste ciclo
+    (um por instrumento, no maximo), so confirma o(s) de maior nota — os
+    outros pares ficam de fora dessa rodada, mesmo tendo sinal valido.
+    Isso e o que faz o robo 'so entrar no padrao mais claro' entre varios
+    pares, em vez de abrir em todo mundo que bateu o gatilho."""
+    if not candidatos:
+        return
+    cfg_a = paper.get_config('A')
+    minimo = cfg_a.get('nota_minima', 55)
+    elegiveis = [c for c in candidatos if c['score'] >= minimo]
+    descartados = [c for c in candidatos if c['score'] < minimo]
+    for c in descartados:
+        log.info('Torneio: %s descartado (nota %.1f < minimo %.1f)', c['symbol'], c['score'], minimo)
+    if not elegiveis:
+        return
+    elegiveis.sort(key=lambda c: c['score'], reverse=True)
+    log.info('Torneio A: %s', ', '.join(f"{c['symbol']}={c['score']:.1f}" for c in elegiveis))
+    for candidato in elegiveis:
+        eventos = paper.comprometer_torneio(candidato)
+        await _emitir_eventos_paper(eventos)
+
 
 async def loop_monitoramento():
     while True:
         agora = time.time()
+        candidatos = []
         for symbol in estado["symbols"]:
             try:
-                await processar_symbol(symbol, agora)
+                cand = await processar_symbol(symbol, agora)
+                if cand:
+                    candidatos.append(cand)
             except Exception as e:
                 estado['erros'][symbol] = {'hora':paper.agora().isoformat(),'erro':str(e)}
                 log.exception('Falha no monitoramento de %s', symbol)
                 await broadcast({"tipo": "erro", "symbol": symbol, "msg": str(e)})
+
+        try:
+            await resolver_torneio(candidatos)
+        except Exception:
+            log.exception('Falha no torneio multi-par da Estrategia A')
 
         await asyncio.sleep(POLL_SEGUNDOS)
 

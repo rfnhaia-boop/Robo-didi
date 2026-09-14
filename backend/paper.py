@@ -7,7 +7,7 @@ import sqlite3
 import datetime as dt
 import pandas as pd
 from backend.config import SPREADS
-from backend.engine import sinal_smc
+from backend.engine import sinal_smc, score_sinal
 from backend.strategy import entry_signal, market_open
 from backend.execution import VERSION, INTERVAL_SECONDS, validate_candles, size_position, advance, pnl
 
@@ -20,14 +20,18 @@ _BASE = dict(ativo=True, tf='30min', rr=3.0, risco_pct=0.25,
              hora_ini=8, hora_fim=13, respeitar_horario=True, breakeven=True,
              cb_ativo=True, max_trades_dia=3, perda_max_dia_pct=1.0,
              max_posicoes=3, exposicao_max_pct=1.0, drawdown_max_pct=10.0,
-             spread_stop_max=0.20, slippage_spreads=0.5)
+             spread_stop_max=0.20, slippage_spreads=0.5,
+             # nota_minima: piso de qualidade (0-100, engine.score_sinal) do
+             # torneio multi-par. So usada pela Estrategia A (Didi) — as
+             # outras ignoram, mas fica na base pra simplificar a validacao.
+             nota_minima=55.0)
 ESTRATEGIAS = {
     'A': {**_BASE, 'nome':'Didi (Agulhada)', 'tipo':'didi', 'estagio_min':3},
     'B': {**_BASE, 'ativo':False, 'nome':'Smart Money (Sweep) — suspensa', 'tipo':'smc', 'lookback':10},
     'C': {**_BASE, 'nome':'Tendencia (Rompimento)', 'tipo':'trend', 'rr':2.0,
           'breakeven':False, 'symbols':['XAU/USD','BTC/USD']},
 }
-CHAVES_VALIDAS = set(_BASE) | {'nome','tipo','estagio_min','lookback','symbols'}
+CHAVES_VALIDAS = set(_BASE) | {'nome','tipo','estagio_min','lookback','symbols','nota_minima'}
 
 
 def agora():
@@ -104,7 +108,7 @@ def validate_config(cfg):
               'exposicao_max_pct':(0.1,5), 'drawdown_max_pct':(1,20),
               'spread_stop_max':(0.01,0.5), 'slippage_spreads':(0,5),
               'max_trades_dia':(1,20), 'max_posicoes':(1,10),
-              'hora_ini':(0,23), 'hora_fim':(1,24)}
+              'hora_ini':(0,23), 'hora_fim':(1,24), 'nota_minima':(0,100)}
     for k, (lo,hi) in bounds.items():
         v=cfg[k]
         if isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(v) or not lo<=v<=hi:
@@ -188,6 +192,93 @@ def _sinal_entrada(estr,cfg,aval,df):
     return entry_signal(cfg,aval,df)
 
 
+def _elegivel_para_entrada(c,estr,symbol,tf,cfg,hora_brt,ts):
+    """Todas as travas que valem no momento de abrir (sem tocar no banco).
+    Usada tanto pela entrada direta (smc/trend) quanto pelo torneio (didi)."""
+    if not cfg['ativo'] or tf!=cfg['tf']:
+        return False
+    if cfg['respeitar_horario'] and not cfg['hora_ini']<=hora_brt<cfg['hora_fim']:
+        return False
+    if cfg.get('symbols') and symbol not in cfg['symbols']:
+        return False
+    if not market_open(symbol,pd.Timestamp(ts)+pd.Timedelta(seconds=INTERVAL_SECONDS[tf])):
+        return False
+    if c.execute("SELECT 1 FROM posicoes WHERE estrategia=? AND status='aberta' AND (symbol=? OR erro_dados IS NOT NULL)",(estr,symbol)).fetchone():
+        return False
+    count=c.execute("SELECT COUNT(*) FROM posicoes WHERE estrategia=? AND status='aberta'",(estr,)).fetchone()[0]
+    if count>=cfg['max_posicoes']:
+        return False
+    return True
+
+
+def _comprometer_entrada(c,estr,symbol,tf,cfg,signal,ts):
+    """Grava a posicao no banco (budget + circuit breaker + insert).
+    Chamada so depois que a elegibilidade ja foi confirmada."""
+    entry,stop=signal['entrada'],signal['sl']
+    distance=entry-stop if signal['direcao']=='compra' else stop-entry
+    spread=_spread(symbol)
+    if distance<=0 or spread/distance>cfg['spread_stop_max']:
+        return []
+    budget=round(_banca(c,estr)*cfg['risco_pct']/100,2)
+    blocked,reason=_circuit_breaker(c,estr,cfg,novo_risco=budget)
+    if blocked:
+        return [dict(evento='bloqueado',estrategia=estr,nome=cfg['nome'],symbol=symbol,tf=tf,motivo=reason,banca=_banca(c,estr))]
+    cost=spread*(1+cfg['slippage_spreads'])
+    size=size_position(entry,stop,budget,cost)
+    target=entry+cfg['rr']*distance if signal['direcao']=='compra' else entry-cfg['rr']*distance
+    c.execute('''INSERT INTO posicoes
+      (estrategia,aberta_em,ts_candle,symbol,tf,direcao,entrada,sl,sl_original,tp,risco_dinheiro,tamanho,
+       ultimo_candle,custo,config_entrada,versao) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+      (estr,agora().isoformat(),ts,symbol,tf,signal['direcao'],entry,stop,stop,target,budget,size,ts,cost,json.dumps(cfg),VERSION))
+    return [dict(evento='abriu',estrategia=estr,nome=cfg['nome'],symbol=symbol,tf=tf,direcao=signal['direcao'],entrada=entry,sl=stop,tp=target,risco=budget)]
+
+
+def candidato_torneio(symbol,tf,aval,df,hora_brt):
+    """Scanner multi-par da Estrategia A (Didi): avalia se este par/candle
+    tem um sinal valido, SEM abrir nada. So calcula e devolve a nota de
+    qualidade (score_sinal) pra comparar contra os outros pares do mesmo
+    ciclo. Quem chama (main.py) junta os candidatos de todos os instrumentos
+    e so confirma (comprometer_torneio) o de maior nota — assim o robo entra
+    so no padrao mais claro entre varios pares, nao no primeiro que aparecer."""
+    if df is None or not len(df):
+        return None
+    c=_conn()
+    try:
+        cfg=get_config('A',c)
+        ts=str(df.datetime.iloc[-1])
+        if not _elegivel_para_entrada(c,'A',symbol,tf,cfg,hora_brt,ts):
+            return None
+        signal=entry_signal(cfg,aval,df)
+        if not signal:
+            return None
+        return dict(estrategia='A',symbol=symbol,tf=tf,ts=ts,hora_brt=hora_brt,
+                    signal=signal,score=score_sinal(aval))
+    finally:
+        c.close()
+
+
+def comprometer_torneio(candidato):
+    """Abre o candidato vencedor do torneio. Reavalia a elegibilidade na
+    hora (o estado pode ter mudado entre a coleta e a decisao do ciclo)."""
+    c=_conn()
+    try:
+        cfg=get_config('A',c)
+        symbol,tf,ts,hora_brt=candidato['symbol'],candidato['tf'],candidato['ts'],candidato['hora_brt']
+        c.execute('BEGIN IMMEDIATE')
+        try:
+            if not _elegivel_para_entrada(c,'A',symbol,tf,cfg,hora_brt,ts):
+                c.commit()
+                return []
+            events=_comprometer_entrada(c,'A',symbol,tf,cfg,candidato['signal'],ts)
+            c.commit()
+            return events
+        except Exception:
+            c.rollback()
+            raise
+    finally:
+        c.close()
+
+
 def _processar_estrategia(c,estr,symbol,tf,aval,df,hora_brt,permitir_entradas=True):
     cfg=get_config(estr,c)
     events=[]
@@ -233,40 +324,20 @@ def _processar_estrategia(c,estr,symbol,tf,aval,df,hora_brt,permitir_entradas=Tr
     fresh=not previous or pd.Timestamp(previous[0])<pd.Timestamp(ts)
     if fresh:
         c.execute('INSERT OR REPLACE INTO ciclos VALUES (?,?,?,?)',(estr,symbol,tf,ts))
-    if not (fresh and permitir_entradas and cfg['ativo'] and tf==cfg['tf']):
+    if not (fresh and permitir_entradas):
         return events
-    if cfg['respeitar_horario'] and not cfg['hora_ini']<=hora_brt<cfg['hora_fim']:
+    # Estrategia A (Didi) NAO abre aqui: o scanner multi-par (candidato_torneio/
+    # comprometer_torneio, chamado pelo main.py depois de rodar todos os
+    # instrumentos do ciclo) decide qual par tem o sinal mais claro e so abre
+    # nele. As outras estrategias continuam com entrada direta, por par.
+    if cfg.get('tipo')=='didi':
         return events
-    if cfg.get('symbols') and symbol not in cfg['symbols']:
-        return events
-    if not market_open(symbol,pd.Timestamp(ts)+pd.Timedelta(seconds=INTERVAL_SECONDS[tf])):
-        return events
-    if c.execute("SELECT 1 FROM posicoes WHERE estrategia=? AND status='aberta' AND (symbol=? OR erro_dados IS NOT NULL)",(estr,symbol)).fetchone():
-        return events
-    count=c.execute("SELECT COUNT(*) FROM posicoes WHERE estrategia=? AND status='aberta'",(estr,)).fetchone()[0]
-    if count>=cfg['max_posicoes']:
+    if not _elegivel_para_entrada(c,estr,symbol,tf,cfg,hora_brt,ts):
         return events
     signal=_sinal_entrada(estr,cfg,aval,df)
     if not signal:
         return events
-    entry,stop=signal['entrada'],signal['sl']
-    distance=entry-stop if signal['direcao']=='compra' else stop-entry
-    spread=_spread(symbol)
-    if distance<=0 or spread/distance>cfg['spread_stop_max']:
-        return events
-    budget=round(_banca(c,estr)*cfg['risco_pct']/100,2)
-    blocked,reason=_circuit_breaker(c,estr,cfg,novo_risco=budget)
-    if blocked:
-        events.append(dict(evento='bloqueado',estrategia=estr,nome=cfg['nome'],symbol=symbol,tf=tf,motivo=reason,banca=_banca(c,estr)))
-        return events
-    cost=spread*(1+cfg['slippage_spreads'])
-    size=size_position(entry,stop,budget,cost)
-    target=entry+cfg['rr']*distance if signal['direcao']=='compra' else entry-cfg['rr']*distance
-    c.execute('''INSERT INTO posicoes
-      (estrategia,aberta_em,ts_candle,symbol,tf,direcao,entrada,sl,sl_original,tp,risco_dinheiro,tamanho,
-       ultimo_candle,custo,config_entrada,versao) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-      (estr,agora().isoformat(),ts,symbol,tf,signal['direcao'],entry,stop,stop,target,budget,size,ts,cost,json.dumps(cfg),VERSION))
-    events.append(dict(evento='abriu',estrategia=estr,nome=cfg['nome'],symbol=symbol,tf=tf,direcao=signal['direcao'],entrada=entry,sl=stop,tp=target,risco=budget))
+    events+=_comprometer_entrada(c,estr,symbol,tf,cfg,signal,ts)
     return events
 
 
