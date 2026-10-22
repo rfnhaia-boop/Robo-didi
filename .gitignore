@@ -24,3 +24,7 @@ Thumbs.db
 *.njsproj
 *.sln
 *.sw?
+
+# Pesquisa: cache de historico baixado da API (grande, reproduzivel com baixar_historico.py)
+pesquisa/*.pkl
+.venv_test/

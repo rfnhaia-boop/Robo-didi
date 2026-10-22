@@ -20,6 +20,7 @@ SPREADS = {
     "GBP/USD": 0.00015,
     "XAU/USD": 0.30,
     "BTC/USD": 15.0,
+    "ETH/USD": 1.0,
     "EUR/BRL": 0.0005,
 }
 

@@ -23,7 +23,9 @@ from backend.config import (
 from typing import Optional
 from pydantic import BaseModel
 
-from backend.engine import carregar_avaliacao, filtro_contexto, df_para_candles, montar_travas, contexto_tendencia
+from backend.engine import (carregar_avaliacao, filtro_contexto, df_para_candles, montar_travas, contexto_tendencia,
+                            buscar_candles, montar_indicadores)
+from backend.strategy import tendencia_score
 from backend.execution import VERSION
 from backend.backtest import rodar_backtest
 from backend import forward
@@ -69,6 +71,7 @@ estado = {
     "precos": {},                # symbol -> ultimo preco (P&L flutuante multi-par)
     "erros": {},
     "versao_motor": VERSION,
+    "tendencia": {},             # symbol -> leitura diaria da estrategia T (nota, ATR, ultima barra)
 }
 
 historico_alertas: deque = deque(maxlen=100)
@@ -328,6 +331,8 @@ async def processar_symbol(symbol, agora):
                 f"Estocastico: {aval['componentes']['estocastico']}\n"
                 + ("⚠️ contra tendencia\n" if alerta["contra_tendencia"] else "")
                 + "".join(f"⛔ {t}\n" for t in (aval.get("guarda", {}).get("travas") or []))
+                + "ℹ️ Só leitura do indicador: em 18 anos de teste o Didi sozinho não mostrou "
+                  "vantagem. O robô opera a Tendência Diária (ouro/BTC/ETH).\n"
                 + alerta["hora"]
             )
             enviar_telegram(msg_tg)
@@ -345,15 +350,20 @@ async def _emitir_eventos_paper(eventos):
         symbol = evt.get("symbol", "")
         if evt["evento"] == "abriu":
             emoji = "🟢" if evt["direcao"] == "compra" else "🔴"
+            saida = ("Saída: stop móvel de 3×ATR ou fim da tendência (sem alvo fixo)"
+                     if evt.get("tipo") == "tendencia" else f"Alvo: {evt['tp']}")
             enviar_telegram(
                 f"{emoji} <b>[{est}] ABRIR {evt['direcao'].upper()}</b> | {symbol} {evt.get('tf','')}\n"
-                f"Entrada: {evt['entrada']}\nStop: {evt['sl']}\nAlvo: {evt['tp']}\n"
+                f"Entrada: {evt['entrada']}\nStop inicial: {evt['sl']}\n{saida}\n"
                 f"Risco: ${evt['risco']}\n(simulacao experimental; nao e ordem para copiar)")
         elif evt["evento"] == "fechou":
-            ico = "✅" if evt["status"] == "alvo" else ("➖" if evt["status"] == "breakeven" else "❌")
+            # icone pelo RESULTADO (uma saida por stop movel pode ser lucro)
+            ico = "➖" if evt["status"] == "breakeven" else ("✅" if evt["resultado"] > 0 else "❌")
             sinal = "+" if evt["resultado"] >= 0 else ""
+            motivo = {"sinal": "tendência acabou", "trail": "stop móvel", "stop": "stop", "alvo": "alvo",
+                      "breakeven": "breakeven"}.get(evt["status"], evt["status"])
             enviar_telegram(
-                f"{ico} <b>[{est}] FECHOU ({evt['status'].upper()})</b> | {symbol} {evt.get('tf','')}\n"
+                f"{ico} <b>[{est}] FECHOU ({motivo})</b> | {symbol} {evt.get('tf','')}\n"
                 f"Resultado: {sinal}${evt['resultado']} ({sinal}{evt['resultado_r']}R)\n"
                 f"Banca: ${evt['banca']}")
         elif evt["evento"] == "bloqueado":
@@ -409,6 +419,58 @@ async def loop_monitoramento():
 
 
 # ==========================================================================
+#  ESTRATEGIA T — TENDENCIA DIARIA (ouro + BTC + ETH)
+# ==========================================================================
+
+_tend_proximo_check = {}    # symbol -> epoch do proximo check (evita gastar credito da API a toa)
+_tend_ultima_barra = {}     # symbol -> timestamp da ultima barra diaria ja processada
+
+
+async def processar_tendencia(symbol, agora):
+    """Busca as barras DIARIAS, calcula a nota de tendencia (-1..1) e deixa o paper
+    abrir/fechar. So chama a API quando pode existir uma barra diaria nova."""
+    if agora < _tend_proximo_check.get(symbol, 0):
+        return
+    df = await asyncio.to_thread(buscar_candles, symbol, '1day', 600)
+    df_ind = montar_indicadores(df)
+    ts = df.datetime.iloc[-1]
+    nova = _tend_ultima_barra.get(symbol) != ts
+    # sem barra nova: tenta de novo em 2h; com barra nova: so no proximo fechamento diario
+    proxima = ts.timestamp() + 2 * 86400 + 300 if nova else agora + 7200
+    _tend_proximo_check[symbol] = max(proxima, agora + 3600)
+    if not nova:
+        return
+    _tend_ultima_barra[symbol] = ts
+    score = float(tendencia_score(df_ind).iloc[-1])
+    estado["tendencia"][symbol] = {
+        "score": round(score, 2), "atr": round(float(df_ind["atr"].iloc[-1]), 5),
+        "close": float(df_ind["close"].iloc[-1]), "barra": str(ts),
+        "leitura": ("ALTA forte" if score >= 0.6 else "ALTA fraca" if score > 0.0 else
+                    "BAIXA forte" if score <= -0.6 else "BAIXA fraca" if score < 0.0 else "neutra"),
+        "atualizado": paper.agora().isoformat(),
+    }
+    # nao abre posicao com dado velho (4 dias cobre fim de semana e feriado)
+    idade_dias = (dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) - (ts + dt.timedelta(days=1))).total_seconds() / 86400
+    permitir = estado["monitorando"] and idade_dias <= 4
+    eventos = paper.processar(symbol, "1day", {}, df_ind, paper.agora().hour, permitir_entradas=permitir)
+    await _emitir_eventos_paper(eventos)
+
+
+async def loop_tendencia():
+    while True:
+        agora = time.time()
+        for symbol in paper.get_config("T").get("symbols", []):
+            try:
+                await processar_tendencia(symbol, agora)
+                estado["erros"].pop("T:" + symbol, None)
+            except Exception as e:
+                estado["erros"]["T:" + symbol] = {"hora": paper.agora().isoformat(), "erro": str(e)}
+                log.exception("Falha na tendencia diaria de %s", symbol)
+            await asyncio.sleep(9)   # respeita o limite de 8 req/min da API gratis
+        await asyncio.sleep(600)
+
+
+# ==========================================================================
 #  RESUMO DIARIO (18:30 BRT)
 # ==========================================================================
 
@@ -445,6 +507,7 @@ async def startup():
     asyncio.create_task(loop_monitoramento())
     asyncio.create_task(loop_resumo_diario())
     asyncio.create_task(loop_telegram_rx())
+    asyncio.create_task(loop_tendencia())
 
 
 # ==========================================================================
@@ -517,6 +580,18 @@ def paper_estado():
         return {"erro": str(e)}
 
 
+@app.get("/api/tendencia")
+def tendencia_estado():
+    """O que a estrategia T esta enxergando agora (nota de tendencia por ativo) + posicoes abertas dela."""
+    try:
+        st = paper.estado().get("estrategias", {}).get("T", {})
+        return {"leitura": estado["tendencia"], "abertas": st.get("abertas", []),
+                "config": {k: st.get("config", {}).get(k) for k in
+                           ("symbols", "entrada_min", "saida_max", "atr_stop", "risco_pct", "somente_compra")}}
+    except Exception as e:
+        return {"erro": str(e)}
+
+
 class PaperConfig(BaseModel):
     ativo: Optional[bool] = None
     tf: Optional[str] = None
@@ -535,10 +610,15 @@ class PaperConfig(BaseModel):
     drawdown_max_pct: Optional[float] = None
     spread_stop_max: Optional[float] = None
     slippage_spreads: Optional[float] = None
+    nota_minima: Optional[float] = None
+    entrada_min: Optional[float] = None
+    saida_max: Optional[float] = None
+    atr_stop: Optional[float] = None
+    somente_compra: Optional[bool] = None
 
 
 @app.post("/api/paper/config")
-def paper_set_config(cfg: PaperConfig, estrategia: str = "A"):
+def paper_set_config(cfg: PaperConfig, estrategia: str = "T"):
     try:
         novo = {k: v for k, v in cfg.model_dump().items() if v is not None}
         return paper.set_config(estrategia.upper(), novo)

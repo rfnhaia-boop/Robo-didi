@@ -16,7 +16,7 @@ class ApiTests(unittest.TestCase):
     def test_status_is_public_and_versioned(self):
         r=self.client.get('/api/status')
         self.assertEqual(r.status_code,200)
-        self.assertEqual(r.json()['versao_motor'],'paper-v2.0')
+        self.assertEqual(r.json()['versao_motor'],'paper-v2.1')
 
     def test_mutation_requires_admin_token(self):
         r=self.client.post('/api/pausar')

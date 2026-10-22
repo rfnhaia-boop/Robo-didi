@@ -8,7 +8,7 @@ import datetime as dt
 import pandas as pd
 from backend.config import SPREADS
 from backend.engine import sinal_smc, score_sinal
-from backend.strategy import entry_signal, market_open
+from backend.strategy import entry_signal, market_open, tendencia_score, tendencia_saida, TEND_MIN_BARRAS
 from backend.execution import VERSION, INTERVAL_SECONDS, validate_candles, size_position, advance, pnl
 
 log = logging.getLogger(__name__)
@@ -26,12 +26,23 @@ _BASE = dict(ativo=True, tf='30min', rr=3.0, risco_pct=0.25,
              # outras ignoram, mas fica na base pra simplificar a validacao.
              nota_minima=55.0)
 ESTRATEGIAS = {
-    'A': {**_BASE, 'nome':'Didi (Agulhada)', 'tipo':'didi', 'estagio_min':3},
+    # T e a unica estrategia ativa: tendencia diaria em ouro + BTC + ETH (pesquisa de
+    # 18 anos: positiva no treino 2008-2019 E no teste cego 2020-2026). Risco 1% por
+    # posicao porque opera poucas vezes (~9 mudancas de posicao por ano por ativo).
+    'T': {**_BASE, 'nome':'Tendência Diária (Ouro + Cripto)', 'tipo':'tendencia', 'tf':'1day', 'rr':10.0,
+          'risco_pct':1.0, 'respeitar_horario':False, 'breakeven':False, 'max_trades_dia':3,
+          'perda_max_dia_pct':4.0, 'exposicao_max_pct':4.0, 'drawdown_max_pct':15.0, 'max_posicoes':3,
+          'symbols':['XAU/USD','BTC/USD','ETH/USD'], 'entrada_min':0.6, 'saida_max':-0.2,
+          'atr_stop':3.0, 'somente_compra':False},
+    # A/B/C ficam no codigo (backtest, testes) mas DESLIGADAS: em 18 anos o Didi nao mostrou
+    # vantagem estatistica (Sharpe < 0 no treino, ~0 no teste cego) e em FX so paga custo.
+    'A': {**_BASE, 'ativo':False, 'nome':'Didi (Agulhada) — suspensa', 'tipo':'didi', 'estagio_min':3},
     'B': {**_BASE, 'ativo':False, 'nome':'Smart Money (Sweep) — suspensa', 'tipo':'smc', 'lookback':10},
-    'C': {**_BASE, 'nome':'Tendencia (Rompimento)', 'tipo':'trend', 'rr':2.0,
+    'C': {**_BASE, 'ativo':False, 'nome':'Rompimento 30min — suspensa', 'tipo':'trend', 'rr':2.0,
           'breakeven':False, 'symbols':['XAU/USD','BTC/USD']},
 }
-CHAVES_VALIDAS = set(_BASE) | {'nome','tipo','estagio_min','lookback','symbols','nota_minima'}
+CHAVES_VALIDAS = set(_BASE) | {'nome','tipo','estagio_min','lookback','symbols','nota_minima',
+                               'entrada_min','saida_max','atr_stop','somente_compra'}
 
 
 def agora():
@@ -76,7 +87,8 @@ def _conn():
         id INTEGER PRIMARY KEY AUTOINCREMENT, estrategia TEXT, ts INTEGER, banca REAL)''')
     columns = {r[1] for r in c.execute('PRAGMA table_info(posicoes)')}
     for name, kind in [('ultimo_candle','TEXT'),('custo','REAL'),('config_entrada','TEXT'),
-                       ('versao','TEXT'),('erro_dados','TEXT'),('candle_saida','TEXT')]:
+                       ('versao','TEXT'),('erro_dados','TEXT'),('candle_saida','TEXT'),
+                       ('trail','REAL')]:
         if name not in columns:
             c.execute(f'ALTER TABLE posicoes ADD COLUMN {name} {kind}')
     c.execute('''CREATE TABLE IF NOT EXISTS ciclos (
@@ -118,11 +130,18 @@ def validate_config(cfg):
             raise ValueError(k+': esperado inteiro')
     if cfg['hora_ini']>=cfg['hora_fim'] or cfg['tf'] not in INTERVAL_SECONDS:
         raise ValueError('Horario ou timeframe invalido')
-    if cfg['tipo'] not in ('didi','smc','trend') or cfg.get('estagio_min',3) not in (2,3):
+    if cfg['tipo'] not in ('didi','smc','trend','tendencia') or cfg.get('estagio_min',3) not in (2,3):
         raise ValueError('Estrategia invalida')
     lookback=cfg.get('lookback',10)
     if type(lookback) is not int or not 3<=lookback<=100:
         raise ValueError('Lookback invalido')
+    if cfg['tipo']=='tendencia':
+        for k,(lo,hi) in {'entrada_min':(0.2,1.0),'saida_max':(-1.0,0.2),'atr_stop':(1.0,8.0)}.items():
+            v=cfg[k]
+            if isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(v) or not lo<=v<=hi:
+                raise ValueError(k+': fora dos limites')
+        if type(cfg['somente_compra']) is not bool:
+            raise ValueError('somente_compra: esperado booleano')
 
 
 def set_config(estr, novo):
@@ -201,7 +220,9 @@ def _elegivel_para_entrada(c,estr,symbol,tf,cfg,hora_brt,ts):
         return False
     if cfg.get('symbols') and symbol not in cfg['symbols']:
         return False
-    if not market_open(symbol,pd.Timestamp(ts)+pd.Timedelta(seconds=INTERVAL_SECONDS[tf])):
+    # Barra diaria: o fechamento "oficial" cai fora do pregao (ex.: sexta 00:00 UTC), mas
+    # o preco de fechamento existiu — so intradiario precisa checar calendario.
+    if INTERVAL_SECONDS[tf]<86400 and not market_open(symbol,pd.Timestamp(ts)+pd.Timedelta(seconds=INTERVAL_SECONDS[tf])):
         return False
     if c.execute("SELECT 1 FROM posicoes WHERE estrategia=? AND status='aberta' AND (symbol=? OR erro_dados IS NOT NULL)",(estr,symbol)).fetchone():
         return False
@@ -226,11 +247,13 @@ def _comprometer_entrada(c,estr,symbol,tf,cfg,signal,ts):
     cost=spread*(1+cfg['slippage_spreads'])
     size=size_position(entry,stop,budget,cost)
     target=entry+cfg['rr']*distance if signal['direcao']=='compra' else entry-cfg['rr']*distance
+    trail=signal.get('trail')
     c.execute('''INSERT INTO posicoes
       (estrategia,aberta_em,ts_candle,symbol,tf,direcao,entrada,sl,sl_original,tp,risco_dinheiro,tamanho,
-       ultimo_candle,custo,config_entrada,versao) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-      (estr,agora().isoformat(),ts,symbol,tf,signal['direcao'],entry,stop,stop,target,budget,size,ts,cost,json.dumps(cfg),VERSION))
-    return [dict(evento='abriu',estrategia=estr,nome=cfg['nome'],symbol=symbol,tf=tf,direcao=signal['direcao'],entrada=entry,sl=stop,tp=target,risco=budget)]
+       ultimo_candle,custo,config_entrada,versao,trail) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+      (estr,agora().isoformat(),ts,symbol,tf,signal['direcao'],entry,stop,stop,target,budget,size,ts,cost,json.dumps(cfg),VERSION,trail))
+    return [dict(evento='abriu',estrategia=estr,nome=cfg['nome'],tipo=cfg['tipo'],symbol=symbol,tf=tf,direcao=signal['direcao'],
+                 entrada=entry,sl=stop,tp=target,risco=budget,trail=trail)]
 
 
 def candidato_torneio(symbol,tf,aval,df,hora_brt):
@@ -279,6 +302,19 @@ def comprometer_torneio(candidato):
         c.close()
 
 
+def _fechar_posicao(c,estr,cfg,p,status,price,cursor,symbol,tf,cost):
+    """Realiza o resultado, atualiza banca/equity e devolve o evento 'fechou'."""
+    value,rr=pnl(p,price,cost)
+    value=round(value,2)
+    bank=round(_banca(c,estr)+value,2)
+    c.execute('''UPDATE posicoes SET status=?,fechada_em=?,preco_saida=?,resultado=?,resultado_r=?,candle_saida=? WHERE id=?''',
+              (status,agora().isoformat(),price,value,round(rr,4),cursor,p['id']))
+    c.execute('UPDATE contas SET banca=? WHERE estrategia=?',(bank,estr))
+    c.execute('INSERT INTO equity (estrategia,ts,banca) VALUES (?,?,?)',(estr,int(agora().timestamp()),bank))
+    return dict(evento='fechou',estrategia=estr,nome=cfg['nome'],symbol=symbol,tf=tf,
+                direcao=p['direcao'],status=status,resultado=value,resultado_r=round(rr,4),saida=price,banca=bank)
+
+
 def _processar_estrategia(c,estr,symbol,tf,aval,df,hora_brt,permitir_entradas=True):
     cfg=get_config(estr,c)
     events=[]
@@ -310,15 +346,17 @@ def _processar_estrategia(c,estr,symbol,tf,aval,df,hora_brt,permitir_entradas=Tr
                   (p['sl'],p['breakeven'],cursor,'legacy-replayed-v2' if legacy else p['versao'],p['id']))
         if exit_event:
             status,price=exit_event
-            value,rr=pnl(p,price,cost)
-            value=round(value,2)
-            bank=round(_banca(c,estr)+value,2)
-            c.execute('''UPDATE posicoes SET status=?,fechada_em=?,preco_saida=?,resultado=?,resultado_r=?,candle_saida=? WHERE id=?''',
-                      (status,agora().isoformat(),price,value,round(rr,4),cursor,p['id']))
-            c.execute('UPDATE contas SET banca=? WHERE estrategia=?',(bank,estr))
-            c.execute('INSERT INTO equity (estrategia,ts,banca) VALUES (?,?,?)',(estr,int(agora().timestamp()),bank))
-            events.append(dict(evento='fechou',estrategia=estr,nome=cfg['nome'],symbol=symbol,tf=tf,
-                               direcao=p['direcao'],status=status,resultado=value,resultado_r=round(rr,4),saida=price,banca=bank))
+            events.append(_fechar_posicao(c,estr,cfg,p,status,price,cursor,symbol,tf,cost))
+    if cfg.get('tipo')=='tendencia' and len(df)>=TEND_MIN_BARRAS:
+        # Saida por sinal: a maioria dos 5 indicadores de tendencia virou contra a posicao.
+        # Fecha no preco de fechamento da barra que gerou o sinal (mesma regra do backtest).
+        score=float(tendencia_score(df).iloc[-1])
+        ultimo=str(df.datetime.iloc[-1])
+        for row in c.execute("SELECT * FROM posicoes WHERE status='aberta' AND estrategia=? AND symbol=? AND tf=?",(estr,symbol,tf)).fetchall():
+            p=dict(row)
+            if tendencia_saida(cfg,p['direcao'],score):
+                cost=p['custo'] if p['custo'] is not None else _spread(symbol)
+                events.append(_fechar_posicao(c,estr,cfg,p,'sinal',float(df.close.iloc[-1]),ultimo,symbol,tf,cost))
     ts=str(df.datetime.iloc[-1])
     previous=c.execute('SELECT ts FROM ciclos WHERE estrategia=? AND symbol=? AND tf=?',(estr,symbol,tf)).fetchone()
     fresh=not previous or pd.Timestamp(previous[0])<pd.Timestamp(ts)
@@ -383,7 +421,11 @@ def _estado_estrategia(c,estr):
 def estado():
     c=_conn()
     try:
-        states={e:_estado_estrategia(c,e) for e in ESTRATEGIAS}
-        return {**states['A'],'estrategias':states}
+        todas={e:_estado_estrategia(c,e) for e in ESTRATEGIAS}
+        # So mostra o que esta ligado ou ja tem historico — estrategias suspensas e
+        # vazias (A/B/C na campanha nova) so poluiriam o painel.
+        states={e:s for e,s in todas.items() if s['config']['ativo'] or s['total_operacoes'] or s['n_abertas']} or todas
+        principal=next(iter(states))
+        return {**states[principal],'estrategias':states,'principal':principal}
     finally:
         c.close()

@@ -14,6 +14,9 @@ class PaperTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         paper.DB = str(Path(self.tmp.name) / 'paper.db')
 
+    def ligar_a(self):
+        paper.set_config('A', {'ativo': True})   # A/B/C nascem suspensas; os testes do torneio ligam a A
+
     def tearDown(self):
         self.tmp.cleanup()
 
@@ -23,6 +26,7 @@ class PaperTests(unittest.TestCase):
         return d
 
     def test_processar_never_opens_estrategia_a_directly(self):
+        self.ligar_a()
         # Estrategia A (Didi) so abre via o torneio multi-par (candidato_torneio
         # + comprometer_torneio), nunca dentro de processar() — isso garante que
         # o scanner sempre compara os candidatos de todos os pares antes de abrir.
@@ -40,6 +44,7 @@ class PaperTests(unittest.TestCase):
         self.assertEqual(events,[])
 
     def test_torneio_nao_abre_duas_vezes_no_mesmo_par(self):
+        self.ligar_a()
         rows=[]
         for ts in pd.date_range('2026-09-09 05:00', periods=60, freq='30min'):
             rows.append((ts,100,102,98,100))
@@ -58,6 +63,7 @@ class PaperTests(unittest.TestCase):
             paper.entry_signal=original
 
     def test_scanner_so_abre_no_candidato_de_maior_nota(self):
+        self.ligar_a()
         # Simula o cenario que o Rafael pediu: varios pares com sinal valido
         # no mesmo ciclo, so entra no que tiver a nota mais alta (padrao mais
         # claro / menos chance de erro).
@@ -114,6 +120,75 @@ class PaperTests(unittest.TestCase):
         self.assertEqual(c.execute('SELECT banca FROM equity_legacy_v1').fetchone()[0],9990)
         self.assertIn('estrategia',{r[1] for r in c.execute('PRAGMA table_info(posicoes)')})
         c.close()
+
+    # ---------------------------------------------------------------- Estrategia T (tendencia diaria)
+    def daily(self, n=300, passo=1.0, fim='2026-10-16'):
+        import numpy as np
+        close = 100 + np.arange(n) * passo
+        idx = pd.date_range(end=fim, periods=n, freq='D')
+        return pd.DataFrame({'datetime': idx, 'open': close, 'high': close + 1, 'low': close - 1,
+                             'close': close, 'atr': 2.0})
+
+    def test_tendencia_opens_on_friday_daily_bar_for_gold(self):
+        # barra diaria de sexta: o calendario intradiario nao pode bloquear (so vale pra 30min/1h)
+        ev = paper.processar('XAU/USD', '1day', {}, self.daily(), 10)
+        abriu = [e for e in ev if e['evento'] == 'abriu']
+        self.assertEqual(len(abriu), 1)
+        self.assertEqual((abriu[0]['estrategia'], abriu[0]['direcao'], abriu[0]['trail']), ('T', 'compra', 6.0))
+        c = paper._conn()
+        row = dict(c.execute("SELECT * FROM posicoes WHERE estrategia='T'").fetchone()); c.close()
+        self.assertEqual(row['sl'], row['entrada'] - 6.0)
+        self.assertGreater(row['tamanho'], 0)
+        # risco = 1% da banca, e a mesma barra nao abre de novo
+        self.assertEqual(row['risco_dinheiro'], 100.0)
+        self.assertEqual(paper.processar('XAU/USD', '1day', {}, self.daily(), 10), [])
+
+    def test_tendencia_ignores_pairs_outside_its_universe(self):
+        self.assertEqual(paper.processar('EUR/USD', '1day', {}, self.daily(), 10), [])
+
+    def test_tendencia_trailing_stop_closes_with_profit(self):
+        paper.processar('XAU/USD', '1day', {}, self.daily(), 10)
+        d = self.daily()
+        ultimo = d.iloc[-1]
+        extra = pd.DataFrame([{'datetime': ultimo.datetime + pd.Timedelta(days=1), 'open': ultimo.close + 5, 'high': ultimo.close + 20,
+                               'low': ultimo.close + 4, 'close': ultimo.close + 19, 'atr': 2.0},
+                              {'datetime': ultimo.datetime + pd.Timedelta(days=2), 'open': ultimo.close + 10, 'high': ultimo.close + 11,
+                               'low': ultimo.close + 5, 'close': ultimo.close + 6, 'atr': 2.0}])
+        ev = paper.processar('XAU/USD', '1day', {}, pd.concat([d, extra], ignore_index=True), 10)
+        fechou = [e for e in ev if e['evento'] == 'fechou']
+        self.assertEqual(len(fechou), 1)
+        self.assertEqual(fechou[0]['status'], 'trail')
+        self.assertGreater(fechou[0]['resultado'], 0)       # stop subiu junto com o preco: saiu no lucro
+
+    def test_tendencia_signal_exit_closes_at_bar_close(self):
+        paper.processar('XAU/USD', '1day', {}, self.daily(), 10)
+        d = self.daily()
+        ultimo = d.iloc[-1]
+        nova = pd.DataFrame([{'datetime': ultimo.datetime + pd.Timedelta(days=1), 'open': ultimo.close, 'high': ultimo.close + 1,
+                              'low': ultimo.close - 1, 'close': ultimo.close, 'atr': 2.0}])
+        original = paper.tendencia_score
+        paper.tendencia_score = lambda df: pd.Series(-0.6, index=df.index)   # maioria virou pra baixa
+        try:
+            ev = paper.processar('XAU/USD', '1day', {}, pd.concat([d, nova], ignore_index=True), 10)
+        finally:
+            paper.tendencia_score = original
+        fechou = [e for e in ev if e['evento'] == 'fechou']
+        self.assertEqual([e['status'] for e in fechou], ['sinal'])
+        self.assertEqual(fechou[0]['saida'], float(ultimo.close))
+
+    def test_a_b_c_start_suspended_and_hidden_until_used(self):
+        st = paper.estado()
+        self.assertEqual(list(st['estrategias']), ['T'])  # so a T esta ligada e visivel (A/B/C suspensas e vazias)
+        self.assertEqual((st['principal'], st['estrategia']), ('T', 'T'))
+        self.ligar_a()
+        self.assertEqual(list(paper.estado()['estrategias']), ['T', 'A'])   # A ligada passa a aparecer
+
+    def test_tendencia_config_bounds(self):
+        with self.assertRaises(ValueError):
+            paper.set_config('T', {'atr_stop': 0.5})
+        with self.assertRaises(ValueError):
+            paper.set_config('T', {'entrada_min': 1.5})
+        self.assertEqual(paper.set_config('T', {'somente_compra': True})['somente_compra'], True)
 
 
 if __name__ == '__main__':

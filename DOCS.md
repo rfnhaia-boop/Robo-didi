@@ -77,22 +77,32 @@ com 3+ confluências).
 
 ---
 
-## 4. As duas estratégias (paper.py)
+## 4. Estratégias (paper.py / strategy.py)
 
-Rodam **em paralelo**, cada uma com banca de $10.000 própria, posições e config
-independentes. Servem para comparar ao vivo qual performa melhor (A/B).
+> **Atualização out/2026 — o que a pesquisa mostrou.** Em 18 anos de dados (treino 2008-2019, teste cego
+> 2020-2026, custos incluídos — scripts em `pesquisa/`), o **Didi sozinho não tem vantagem estatística**
+> (Sharpe < 0 no treino, ~0 no teste cego) e **nenhum sistema técnico testado paga o custo em pares de FX**.
+> A única família com vantagem nos dois períodos foi **tendência diária em ouro + BTC + ETH**. Por isso a
+> **Estratégia T é a única ligada**; A/B/C ficam no código (backtest/testes), suspensas.
 
-### Estratégia A — Didi (Agulhada)
-Momentum / continuação de tendência (a "campeã" validada no walk-forward).
-- Entra no **estágio 3** (agulhada + confluências), a favor da tendência do 1h
-- **Filtro ADX ≥ 20** (só tendência real)
-- Stop na mínima/máxima dos últimos 5 candles · Alvo por RR
+### Estratégia T — Tendência Diária (ligada)
+- Ativos: **XAU/USD, BTC/USD, ETH/USD**, barras diárias (consulta a API ~1x por dia por ativo).
+- **Nota de tendência** em [-1, +1] = média de 5 sinais sem estado: preço vs SMA100, vs SMA200, retorno de 120d,
+  retorno de 250d e preço vs meio do canal de 100 dias (`strategy.tendencia_score`).
+- **Entrada:** nota ≥ +0,6 (compra) ou ≤ −0,6 (venda) — ou seja, ≥ 4 dos 5 sinais concordam. Entra no fechamento da barra.
+- **Stop:** 3×ATR(14), **móvel** (acompanha a máxima/mínima, só no sentido favorável, vale a partir da barra seguinte).
+  Sem alvo fixo (alvo simbólico a 10R). **Saída por sinal:** quando a maioria vira (nota ≤ −0,2 na compra).
+- **Risco:** 1% da banca por posição, até 3 posições, exposição agregada máx. 4%, circuit breaker de perda diária 4%,
+  trava de campanha em −15% de drawdown.
+- Backtest com o código de produção (1% de risco por posição, custo 1,5× spread): XAU +2,1%/ano (DD 7,6%), BTC +5,0%/ano
+  (DD 5,2%), ETH +4,6%/ano (DD 6,8%), cada um sobre a banca inteira. Custo 4× maior mal muda. **Não inclui swap/funding.**
+- `GET /api/tendencia` mostra a nota atual por ativo e as posições abertas.
 
-### Estratégia B — Smart Money (Liquidity Sweep)
-Reversão na liquidez — como os bancos "caçam stops" do varejo (`engine.sinal_smc`).
-- **Compra:** o candle varre a mínima recente (lookback 10) e **fecha de volta acima** dela
-- **Venda:** varre a máxima recente e fecha de volta abaixo
-- Stop no extremo varrido · Alvo por RR
+### Estratégias A (Didi), B (Smart Money) e C (Rompimento 30min) — suspensas
+Mantidas para comparação/backtest. A: agulhada confirmada (+1 candle), filtro DI+/DI−, ADX ≥ 20, piso de stop 1×ATR e
+scanner multi-par (`candidato_torneio`/`comprometer_torneio`) que só abre o par de maior nota. B: *liquidity sweep*.
+C: rompimento de 20 barras no 30min com stop 2×ATR. Para religar qualquer uma: `POST /api/paper/config?estrategia=A`
+com `{"ativo": true}` (exige `X-Admin-Token`).
 
 ### Regras comuns (config de cada estratégia)
 | Parâmetro | Padrão | O que faz |
@@ -131,6 +141,7 @@ cada operação para os números ficarem honestos.
 | Rota | Método | O que retorna/faz |
 |---|---|---|
 | `/api/status` | GET | Estado geral + dados dos instrumentos |
+| `/api/tendencia` | GET | Nota de tendência por ativo + posições abertas da estratégia T |
 | `/api/candles/{tf}?symbol=` | GET | Candles + indicadores de um instrumento |
 | `/api/paper` | GET | Estado das 2 estratégias (banca, trades, posições) |
 | `/api/paper/config?estrategia=A\|B` | POST | Altera config de uma estratégia |

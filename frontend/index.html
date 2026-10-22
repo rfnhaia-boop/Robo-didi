@@ -3068,10 +3068,11 @@
     </div>
 
     <div id="op-cb" class="op-cb"></div>
+    <div id="op-tend" class="op-cb ok" style="display:none;flex-wrap:wrap;gap:6px 18px;"></div>
 
     <div class="painel" style="padding:22px 24px;">
       <div class="sidebar-title"><i data-lucide="radio"></i> Posições Abertas Agora</div>
-      <div id="op-abertas"><div class="op-vazio">Nenhuma posição aberta. Ligue o robô e aguarde um sinal válido (estágio 3, na janela 8h-13h).</div></div>
+      <div id="op-abertas"><div class="op-vazio">Nenhuma posição aberta. A tendência diária só entra quando pelo menos 4 dos 5 indicadores concordam (ver leitura acima).</div></div>
     </div>
 
     <div class="painel" style="padding:22px 24px;">
@@ -5023,7 +5024,22 @@ async function atualizarOperacao() {
   } catch (_) {}
 }
 
-let opEstr = 'A';   // estrategia selecionada no detalhe da Operação
+let opEstr = 'T';   // estrategia selecionada no detalhe da Operação
+
+let _tendUlt = 0;
+function carregarTendencia() {
+  const el = document.getElementById('op-tend');
+  if (!el || Date.now() - _tendUlt < 30000) return;
+  _tendUlt = Date.now();
+  fetch('/api/tendencia').then(r => r.json()).then(d => {
+    const L = d.leitura || {}, syms = Object.keys(L);
+    if (!syms.length) { el.style.display = 'none'; return; }
+    el.style.display = 'flex';
+    const cor = s => s >= 0.6 ? '#2ecc71' : s <= -0.6 ? '#ff5e5e' : '#f5c451';
+    el.innerHTML = '<span>📈 <b>Leitura da tendência diária</b> (entra com ≥ +0,6 ou ≤ −0,6; sai quando a maioria vira):</span>' +
+      syms.map(s => `<span><b>${s}</b> <b style="color:${cor(L[s].score)}">${L[s].score > 0 ? '+' : ''}${L[s].score.toFixed(1)}</b> ${L[s].leitura}</span>`).join('');
+  }).catch(() => {});
+}
 
 function selecionarEstrategiaOp(estr) {
   opEstr = estr;
@@ -5063,6 +5079,7 @@ function renderSelEstrategia(estrategias) {
 }
 
 function renderOperacao(full) {
+  if (full.estrategias && !full.estrategias[opEstr]) opEstr = full.principal || Object.keys(full.estrategias)[0];
   renderVersus(full.estrategias);
   renderSelEstrategia(full.estrategias);
   const e = (full.estrategias && full.estrategias[opEstr]) ? full.estrategias[opEstr] : full;
@@ -5126,7 +5143,7 @@ function renderOperacao(full) {
       </div>`;
     }).join('');
   } else {
-    ab.innerHTML = '<div class="op-vazio">Nenhuma posição aberta. Ligue o robô e aguarde um sinal válido (estágio 3, na janela 8h-13h).</div>';
+    ab.innerHTML = '<div class="op-vazio">Nenhuma posição aberta. A tendência diária só entra quando pelo menos 4 dos 5 indicadores concordam (ver leitura acima).</div>';
   }
 
   // curva da banca
@@ -5140,7 +5157,7 @@ function renderOperacao(full) {
         <td>${f.symbol}</td><td>${f.tf}</td>
         <td class="td-${f.direcao}">${f.direcao.toUpperCase()}</td>
         <td>${f.entrada}</td><td>${f.saida}</td>
-        <td class="${f.resultado >= 0 ? 'td-pos' : 'td-neg'}">${f.resultado >= 0 ? '+' : ''}$${f.resultado} (${f.status === 'alvo' ? '✅' : '❌'} ${f.resultado_r >= 0 ? '+' : ''}${f.resultado_r}R)</td>
+        <td class="${f.resultado >= 0 ? 'td-pos' : 'td-neg'}">${f.resultado >= 0 ? '+' : ''}$${f.resultado} (${f.status === 'breakeven' ? '➖' : (f.resultado > 0 ? '✅' : '❌')} ${f.resultado_r >= 0 ? '+' : ''}${f.resultado_r}R)</td>
         <td style="color:var(--texto-secondary)">${(f.fechada_em || '').slice(0, 16).replace('T', ' ')}</td>
       </tr>`).join('');
   } else {
@@ -5155,6 +5172,7 @@ function renderOperacao(full) {
   document.getElementById('op-cfg-tf').value = e.config.tf || '30min';
   document.getElementById('op-cfg-be').value = e.config.breakeven ? 'sim' : 'nao';
 
+  carregarTendencia();
   lucide.createIcons();
 }
 

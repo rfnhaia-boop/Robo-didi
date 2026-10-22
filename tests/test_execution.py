@@ -42,6 +42,30 @@ class ExecutionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_candles(df)
 
+    def test_trailing_stop_ratchets_only_in_favourable_direction_and_from_next_bar(self):
+        pos = {**self.position(), 'trail': 10.0}
+        # barra sobe ate 125: stop sobe pra 115 (125-10), mas so vale na barra seguinte
+        pos, event = advance(pos, {'open':101,'high':125,'low':100}, False)
+        self.assertIsNone(event)
+        self.assertEqual(pos['sl'], 115)
+        # barra seguinte so recua ate 110: nao rebaixa o stop, mas toca nele (115) -> sai como 'trail'
+        pos, event = advance(pos, {'open':120,'high':121,'low':110}, False)
+        self.assertEqual(event[0], 'trail')
+        self.assertEqual(event[1], 115)
+
+    def test_trailing_stop_short_mirrors(self):
+        pos = {**self.position('venda'), 'trail': 10.0}
+        pos, event = advance(pos, {'open':99,'high':100,'low':80}, False)
+        self.assertIsNone(event)
+        self.assertEqual(pos['sl'], 90)            # 80 + 10
+        pos, event = advance(pos, {'open':85,'high':91,'low':84}, False)
+        self.assertEqual(event, ('trail', 90))
+
+    def test_without_trail_behaviour_is_unchanged(self):
+        pos, event = advance(self.position(), {'open':101,'high':125,'low':100}, False)
+        self.assertIsNone(event)
+        self.assertEqual(pos['sl'], 90)
+
 
 if __name__ == '__main__':
     unittest.main()

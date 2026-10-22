@@ -133,3 +133,82 @@ def rodar_backtest(symbol,interval,estagio_min=3,rr=3.0,risco_pct=0.25,
                 todos_trades=trades,parou_por_drawdown=halted,
                 limitacoes=['Simulacao de fechamento, nao execucao em corretora','Custos estimados fixos; sem swap/funding',
                             'Teste por ativo; nao reproduz concorrencia entre ativos da carteira','DD realizado, nao intrabar'])
+
+
+def rodar_backtest_tendencia(symbol, df, cfg=None, risco_pct=1.0, spread_frac=None,
+                             custo_multiplicador=1.0, drawdown_max_pct=15.0):
+    """Backtest da Estrategia T (tendencia diaria) com as MESMAS funcoes do paper ao vivo:
+    strategy.tendencia_entrada/saida, execution.advance (stop movel), size_position, pnl.
+    Ordem em cada barra (igual ao paper): stop/stop movel -> saida por sinal -> entrada no fechamento.
+    spread_frac: custo como fracao do preco (evita distorcer 18 anos de historico com spread absoluto
+    de hoje); sem ele usa SPREADS[symbol]. Equity marcada a mercado todo dia (drawdown real)."""
+    from backend.strategy import tendencia_score, tendencia_entrada, tendencia_saida, TEND_MIN_BARRAS
+    cfg = {'entrada_min': 0.6, 'saida_max': -0.2, 'atr_stop': 3.0, 'somente_compra': False, **(cfg or {})}
+    if spread_frac is None and symbol not in SPREADS:
+        raise ValueError('Ativo sem custo configurado')
+    df = validate_candles(df)
+    ind = montar_indicadores(df[['datetime', 'open', 'high', 'low', 'close']])
+    score = tendencia_score(ind).values
+    bank = peak = 10000.0
+    position, halted = None, False
+    trades, equity = [], []
+
+    def custo(preco):
+        spread = spread_frac * preco if spread_frac is not None else SPREADS[symbol]
+        return spread * 1.5 * custo_multiplicador
+
+    def fechar(bar, price, status):
+        nonlocal bank, position, peak, halted
+        result, r = pnl(position, price, position['custo'])
+        bank = round(bank + round(result, 2), 2)
+        peak = max(peak, bank)
+        halted = halted or (peak - bank) / peak * 100 >= drawdown_max_pct
+        trades.append(dict(entrada_em=position['entrada_em'], data=str(bar.datetime), dir=position['direcao'],
+                           entrada=position['entrada'], saida=price, resultado=round(result, 2),
+                           resultado_r=round(r, 4), motivo=status))
+        position = None
+
+    for i in range(TEND_MIN_BARRAS, len(ind)):
+        bar = ind.iloc[i]
+        if position is not None:
+            position, event = advance(position, bar, False)
+            if event:
+                fechar(bar, event[1], event[0])
+        if position is not None and tendencia_saida(cfg, position['direcao'], score[i]):
+            fechar(bar, float(bar.close), 'sinal')
+        if position is None and not halted:
+            sig = tendencia_entrada(cfg, float(score[i]), float(bar.close), float(bar.atr))
+            if sig:
+                budget = round(bank * risco_pct / 100, 2)
+                c = custo(sig['entrada'])
+                dist = abs(sig['entrada'] - sig['sl'])
+                if budget > 0 and dist > 0:
+                    position = {**sig, 'sl_original': sig['sl'], 'breakeven': 0, 'risco_dinheiro': budget, 'custo': c,
+                                'tamanho': size_position(sig['entrada'], sig['sl'], budget, c),
+                                'tp': sig['entrada'] + (1 if sig['direcao'] == 'compra' else -1) * 10 * dist,
+                                'entrada_em': str(bar.datetime)}
+        mtm = bank + (pnl(position, float(bar.close), position['custo'])[0] if position else 0.0)
+        equity.append((bar.datetime, mtm))
+    if position:
+        fechar(ind.iloc[-1], float(ind.close.iloc[-1]), 'fim do periodo')
+    eq = pd.Series([v for _, v in equity], index=[d for d, _ in equity])
+    dd = ((eq / eq.cummax() - 1).min() * 100) if len(eq) else 0.0
+    wins = [t['resultado'] for t in trades if t['resultado'] > 0]
+    losses = [t['resultado'] for t in trades if t['resultado'] < 0]
+    por_ano = {}
+    if len(eq):
+        fim_ano = eq.groupby(eq.index.year).last()
+        ini = 10000.0
+        for ano, v in fim_ano.items():
+            por_ano[int(ano)] = round((v / ini - 1) * 100, 2)
+            ini = v
+    anos = max((ind.datetime.iloc[-1] - ind.datetime.iloc[TEND_MIN_BARRAS]).days / 365.25, 0.01)
+    return dict(symbol=symbol, periodo=f'{ind.datetime.iloc[TEND_MIN_BARRAS].date()} ate {ind.datetime.iloc[-1].date()}',
+                parametros=dict(cfg=cfg, risco_pct=risco_pct), banca_final=round(bank, 2),
+                retorno_pct=round((bank / 10000 - 1) * 100, 2),
+                retorno_anual_pct=round(((bank / 10000) ** (1 / anos) - 1) * 100, 2),
+                trades=len(trades), trades_por_ano=round(len(trades) / anos, 1),
+                taxa_acerto=round(len(wins) / len(trades) * 100, 1) if trades else 0,
+                fator_lucro=round(sum(wins) / abs(sum(losses)), 3) if losses else None,
+                drawdown_max_pct=round(abs(dd), 2), por_ano=por_ano, parou_por_drawdown=halted,
+                todos_trades=trades)
