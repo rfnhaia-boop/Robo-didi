@@ -361,7 +361,9 @@ def buscar_candles(symbol, interval, outputsize=OUTPUTSIZE):
     df = pd.DataFrame(data["values"])
     df = df.astype({"open": float, "high": float, "low": float, "close": float})
     df["datetime"] = pd.to_datetime(df["datetime"])
-    df = df.sort_values("datetime").reset_index(drop=True)
+    # A API as vezes repete a mesma barra (ex.: stub de domingo do ouro, com fechamentos quase
+    # iguais). Fica com a ultima ocorrencia em vez de derrubar o ativo inteiro na validacao.
+    df = df.sort_values("datetime", kind="stable").drop_duplicates("datetime", keep="last").reset_index(drop=True)
     from backend.execution import INTERVAL_SECONDS, validate_candles
     seconds = INTERVAL_SECONDS[interval]
     now = pd.Timestamp.now(tz='UTC').tz_localize(None)
